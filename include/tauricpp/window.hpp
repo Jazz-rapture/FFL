@@ -43,6 +43,10 @@ public:
         bool borderless = false;        ///< 无边框窗口（无标题栏），需前端自行实现拖拽/关闭/最小化
         std::string start_url = "https://tauricpp.app/index.html";
         COLORREF bg_color = RGB(15, 12, 41);  ///< 默认背景色（匹配前端渐变起点），消除白屏
+        /// 等页面就绪后再显示窗口。窗口会以 WS_EX_LAYERED + alpha=0 的方式"可见但全透明"地
+        /// 存在（必须可见，否则 WebView2 起不来），导航完成后再拉回不透明。
+        /// 用户第一眼看到的就是页面本身，代价是就绪前任务栏里已经有一个窗口条目
+        bool reveal_when_ready = false;
     };
 
     explicit Window(const Config& config = {});
@@ -103,6 +107,14 @@ private:
     /// 创建Win32窗口
     bool CreateNativeWindow();
 
+    /// 让窗口真正显现出来。reveal_when_ready 的窗口一直以 WS_EX_LAYERED + alpha=0
+    /// "可见但全透明"地存在，这里把 alpha 拉回 255 并撤掉兜底计时器；
+    /// 普通窗口就是 ShowWindow + UpdateWindow
+    void RevealWindow();
+
+    /// 设置窗口整体不透明度（仅 reveal_when_ready 的窗口有 WS_EX_LAYERED）
+    void SetWindowAlpha(BYTE alpha);
+
     /// 初始化WebView2
     bool InitWebView();
 
@@ -111,6 +123,9 @@ private:
 
     /// 设置通信桥接
     void SetupBridge();
+
+    /// 接管 WebView2 的原生文件拖放（关掉 AllowExternalDrop，注册自己的 IDropTarget）
+    void SetupFileDrop();
 
     /// 注册窗口操作命令（拖拽、关闭、最小化等）
     void RegisterWindowCommands();
@@ -123,6 +138,10 @@ private:
 
     Config config_;
     HWND hwnd_ = nullptr;
+    /// 窗口客户区的背景画刷（config_.bg_color）。
+    /// 窗口在 WebView2 起来之前就已经显示，WebView2 又是透明背景，
+    /// 所以这个画刷是那段空窗期唯一能看到的颜色，不能省。
+    HBRUSH bg_brush_ = nullptr;
     ICoreWebView2* webview_ = nullptr;
     ICoreWebView2Controller* controller_ = nullptr;
     ICoreWebView2Environment* env_ = nullptr;
