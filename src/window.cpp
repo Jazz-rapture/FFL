@@ -1,15 +1,18 @@
 #include "tauricpp/window.hpp"
 #include "tauricpp/bridge.hpp"
+#include "tauricpp/drop_target.hpp"
 #include "tauricpp/virtual_fs.hpp"
 
 #include <WebView2.h>
 #include <wrl.h>
+#include <ole2.h>          // OleInitialize：OLE 拖放的前置条件
 #include <shlwapi.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <windowsx.h>
 #include <queue>
 #include <mutex>
+#include <cstdio>
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shcore.lib")   // 用于 GetDpiForMonitor / SetProcessDpiAwarenessContext
@@ -21,6 +24,9 @@ using namespace Microsoft::WRL;
 static const UINT WM_TAURICP_EXECUTE_JS = WM_APP + 1;
 // 自定义窗口消息 - 用于投递WebView消息到UI线程发送
 static const UINT WM_TAURICP_POST_MESSAGE = WM_APP + 2;
+// 「就绪后再显示」的兜底计时器：WebView2 迟迟不报导航完成时，也不能让窗口永远看不见
+static const UINT_PTR kRevealFallbackTimer = 1;
+static const UINT kRevealFallbackMs = 5000;
 
 
 // ============================================================================
@@ -106,6 +112,10 @@ Window::~Window() {
         env_->Release();
         env_ = nullptr;
     }
+    if (bg_brush_) {
+        DeleteObject(bg_brush_);
+        bg_brush_ = nullptr;
+    }
 }
 
 // ============================================================================
@@ -130,6 +140,18 @@ static std::string WideToUtf8(const std::wstring& str) {
 }
 
 // ============================================================================
+// WebView2 初始化失败时的报错
+// ============================================================================
+// 以前失败是静默的：窗口照样显示、界面全空，看上去就是"卡死了、什么都没起来"，
+// 完全查不出原因（2026-10-07 实际踩过）。这里把 HRESULT 直接摆到用户面前
+static void ReportWebView2Failure(HRESULT hr, const wchar_t* stage) {
+    wchar_t text[512];
+    swprintf_s(text, L"%s失败。\n\nHRESULT：0x%08X\n\nWebView2 运行时可能缺失、损坏或被占用。",
+               stage, static_cast<unsigned int>(hr));
+    MessageBoxW(nullptr, text, L"TauriCPP", MB_OK | MB_ICONERROR);
+}
+
+// ============================================================================
 // 创建Win32原生窗口
 // ============================================================================
 bool Window::CreateNativeWindow() {
@@ -141,8 +163,9 @@ bool Window::CreateNativeWindow() {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(nullptr);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    // 使用配置的背景色作为窗口类背景，消除白色闪烁
-    wc.hbrBackground = CreateSolidBrush(config_.bg_color);
+    // 用配置的背景色当窗口类背景，并留一份句柄给 WM_ERASEBKGND 自己填
+    bg_brush_ = CreateSolidBrush(config_.bg_color);
+    wc.hbrBackground = bg_brush_;
     wc.lpszClassName = L"TauriCPPWindowClass";
 
     static bool registered = false;
@@ -193,6 +216,10 @@ bool Window::CreateNativeWindow() {
         // 无边框窗口：WS_EX_APPWINDOW 确保出现在任务栏和 Alt+Tab 列表中
         exStyle |= WS_EX_APPWINDOW;
     }
+    if (config_.reveal_when_ready) {
+        // 「就绪后再显示」靠整窗 alpha 实现，所以必须带 WS_EX_LAYERED
+        exStyle |= WS_EX_LAYERED;
+    }
     if (adjustForDpi) {
         adjustForDpi(&rect, style, FALSE, exStyle, targetDpi);
     } else {
@@ -207,7 +234,8 @@ bool Window::CreateNativeWindow() {
         y = (screenH - (rect.bottom - rect.top)) / 2;
     }
 
-    // 关键：创建时不显示窗口（不传WS_VISIBLE），等WebView2导航完成后再显示
+    // 关键：创建时不显示窗口（不传WS_VISIBLE）。窗口要等 WebView2 就绪后
+    // 由 RevealWindow() 显示，见 InitWebView / Run
     hwnd_ = CreateWindowExW(
         exStyle,
         wc.lpszClassName,
@@ -300,12 +328,21 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         return 0;
 
+    case WM_TIMER:
+        // 「就绪后再显示」的兜底：万一 WebView2 一直不报导航完成（或已经失败），
+        // 也必须把窗口显示出来 —— 否则窗口永远不可见，用户只能去任务管理器杀。
+        // 这条兜底是因为 2026-10-07 真的踩过一次"窗口再也不出现"的坑
+        if (self && wParam == kRevealFallbackTimer) {
+            self->RevealWindow();
+            return 0;
+        }
+        break;
+
     case WM_TAURICP_EXECUTE_JS:
         if (self) {
             self->ExecuteJsFromQueue();
         }
         return 0;
-
     case WM_TAURICP_POST_MESSAGE:
         if (self) {
             self->PostWebMessageFromQueue();
@@ -324,6 +361,8 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_DESTROY:
         if (self) {
             self->shutting_down_ = true;
+            // 窗口临死前必须撤掉拖放注册，否则 OLE 还攥着一个已经没了的 HWND
+            tauricpp::UninstallFileDropTree(hwnd);
         }
         PostQuitMessage(0);
         return 0;
@@ -335,9 +374,17 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         return 0;
 
-    case WM_ERASEBKGND:
-        // 阻止系统擦除背景，消除窗口创建时的紫色闪烁
+    case WM_ERASEBKGND: {
+        // 客户区必须被真正填上一次颜色。窗口是先于 WebView2 显示的（见 Run），
+        // 而 WebView2 又是透明背景，所以从窗口显示到页面首次绘制这段时间里，
+        // 屏幕上就是这块客户区：不填的话它是一块从未绘制过的表面，Windows 会
+        // 露出白色，也就是启动时那一段白屏
+        if (!self) break;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc, self->bg_brush_);
         return 1;
+    }
 
     case WM_NCCALCSIZE:
         // 无边框窗口：去掉整个非客户区，窗口内容占满整个窗口
@@ -432,7 +479,13 @@ bool Window::InitWebView() {
         nullptr, userDataFolder.c_str(), nullptr,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [this](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                if (FAILED(result)) return result;
+                // WebView2 起不来时也得把窗口显示出来：否则进程在后台活着，
+                // 屏幕上却什么都没有，用户只能去任务管理器杀
+                if (FAILED(result)) {
+                    RevealWindow();
+                    ReportWebView2Failure(result, L"创建 WebView2 环境");
+                    return result;
+                }
 
                 env_ = env;
                 env_->AddRef();
@@ -440,7 +493,12 @@ bool Window::InitWebView() {
                 env->CreateCoreWebView2Controller(hwnd_,
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                          [this](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
-                             if (FAILED(result)) return result;
+                             // 同上：控制器创建失败也要让窗口可见并报错
+                             if (FAILED(result)) {
+                                 RevealWindow();
+                                 ReportWebView2Failure(result, L"创建 WebView2 控制器");
+                                 return result;
+                             }
 
                             controller_ = controller;
                             controller_->AddRef();
@@ -450,19 +508,25 @@ bool Window::InitWebView() {
                                 webview_->AddRef();
                             }
 
+                            // ★ 关键：默认背景色必须在 put_Bounds 之前设好。
+                            // put_Bounds 一调 WebView2 就开始参与合成，此时背景若还是
+                            // 默认的白色就会闪一下
+                            SetWebViewBackgroundColor();
+
                             // 设置WebView填满窗口
                             RECT bounds;
                             GetClientRect(hwnd_, &bounds);
                             controller_->put_Bounds(bounds);
-
-                            // ★ 关键：设置WebView2默认背景色，消除白屏闪烁
-                            SetWebViewBackgroundColor();
 
                             // 设置虚拟主机名映射（将tauricpp://映射到虚拟文件系统）
                             SetupResourceInterception();
 
                             // 设置通信桥接
                             SetupBridge();
+
+                            // 接管原生文件拖放（必须在 WebView2 就绪后，
+                            // 此时它的子窗口才存在）
+                            SetupFileDrop();
 
                             // 注册窗口操作命令
                             RegisterWindowCommands();
@@ -480,6 +544,12 @@ bool Window::InitWebView() {
                                             GetClientRect(hwnd_, &bounds);
                                             controller_->put_Bounds(bounds);
                                         }
+                                        // 页面已经有了内容，这时候才把透明窗口显示出来
+                                        RevealWindow();
+                                        // 首次 SetupFileDrop 时 WebView2 的子窗口
+                                        // 可能还没建出来，导航完成后再补一次。
+                                        // 已经注册过的话这里是空操作
+                                        SetupFileDrop();
                                         return S_OK;
                                     }
                                 ).Get(),
@@ -498,7 +568,11 @@ bool Window::InitWebView() {
     );
 
     // 异步初始化，不等待（WebView2回调在消息循环中分发）
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) {
+        ReportWebView2Failure(hr, L"创建 WebView2 环境");
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -809,7 +883,29 @@ void Window::SetupBridge() {
 }
 
 // ============================================================================
-// 执行JS - 通过PostMessage投递到UI线程安全执行
+// 接管原生文件拖放
+// ============================================================================
+// WebView2 不会把被拖入文件的真实路径交给页面（File 对象没有 path），
+// 所以只能关掉它内建的外部拖放，自己注册 OLE 拖放目标。
+//
+// 注意：OLE 是按 WindowFromPoint（光标下最深的那个窗口）去找拖放目标的。
+// WebView2 的窗口层级在不同 SDK 版本下不一样，只猜一个"看起来对"的子窗口
+// 注册，很可能注册到一个永远收不到拖放的窗口上 —— 症状就是拖进去毫无反应。
+// 所以这里直接把宿主的整棵窗口树全注册一遍，注册到哪一层由运行时决定。
+void Window::SetupFileDrop() {
+    if (!hwnd_ || !controller_) return;
+
+    // 关掉 WebView2 自己的外部拖放，让它撤掉内建的 IDropTarget，
+    // 否则我们注册不上去
+    ComPtr<ICoreWebView2Controller4> controller4;
+    if (SUCCEEDED(controller_->QueryInterface(IID_PPV_ARGS(&controller4)))) {
+        controller4->put_AllowExternalDrop(FALSE);
+    }
+
+    // hwnd_ 及其所有后代窗口
+    InstallFileDropTree(hwnd_, Bridge::Instance());
+}
+
 // ============================================================================
 void Window::ExecuteJs(const std::string& js) {
     if (shutting_down_ || !hwnd_) return;
@@ -988,17 +1084,42 @@ void Window::ToggleDevTools() {
 // 运行
 // ============================================================================
 int Window::Run() {
-    if (!CreateNativeWindow()) return -1;
+    // OLE 拖放（RegisterDragDrop）要求本线程做过 OleInitialize。
+    // 必须在 WebView2 之前调：WebView2Loader 内部可能已经把线程做成 STA，
+    // 此时这里返回 S_FALSE（已初始化），同样满足要求。
+    // 返回 RPC_E_CHANGED_MODE 说明线程是 MTA，拖放用不了，但不该拖累整个启动
+    const HRESULT oleHr = OleInitialize(nullptr);
+    const bool ole_ready = SUCCEEDED(oleHr);
+
+    if (!CreateNativeWindow()) {
+        if (ole_ready) OleUninitialize();
+        return -1;
+    }
 
     // 记录主线程ID
     mainThreadId_ = GetCurrentThreadId();
 
-    // 立即显示窗口（背景色已通过SetWebViewBackgroundColor和窗口类画刷设置为深色）
-    // 这样用户立刻看到窗口，而不是等WebView2初始化
-    ShowWindow(hwnd_, SW_SHOW);
+    // 窗口必须**先显示**，WebView2 才起得来。实测 2026-10-07：父窗口隐藏时
+    // CreateCoreWebView2EnvironmentWithOptions 同步返回 S_OK，但异步回调拿到失败，
+    // 连 msedgewebview2.exe 都不会被拉起来（用户数据目录里一个文件都不建），
+    // 用户只会看到一个空窗口 —— 所以"把窗口藏着等 WebView2"这条走不通。
+    //
+    // reveal_when_ready 时改成"可见但全透明"：对 WebView2 而言窗口是可见的，
+    // 对用户而言什么都看不到；等导航完成后由 RevealWindow() 拉回不透明。
+    // 白屏的两条治本是：客户区真实填充（WM_ERASEBKGND）+ 背景色与页面底色一致
+    if (config_.reveal_when_ready) {
+        SetWindowAlpha(0);          // 必须在 ShowWindow 之前，否则会闪一下不透明
+        ShowWindow(hwnd_, SW_SHOW);
+        SetTimer(hwnd_, kRevealFallbackTimer, kRevealFallbackMs, nullptr);
+    } else {
+        ShowWindow(hwnd_, SW_SHOW);
+    }
     UpdateWindow(hwnd_);
 
-    if (!InitWebView()) return -1;
+    if (!InitWebView()) {
+        if (ole_ready) OleUninitialize();
+        return -1;
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -1006,7 +1127,34 @@ int Window::Run() {
         DispatchMessageW(&msg);
     }
 
+    // 撤销拖放注册并释放 OLE，必须在窗口销毁之后、线程退出之前
+    tauricpp::UninstallFileDropTree(hwnd_);
+    if (ole_ready) OleUninitialize();
+
     return static_cast<int>(msg.wParam);
+}
+
+// ============================================================================
+// 显示窗口
+// ============================================================================
+// 「就绪后再显示」的窗口是 WS_EX_LAYERED + alpha=0：按 Windows 的定义它是"可见"的
+// （WebView2 只能在这种窗口上起来），但用户什么都看不到。这里把 alpha 拉回 255，
+// 顺带撤掉兜底计时器
+void Window::RevealWindow() {
+    if (!hwnd_) return;
+    KillTimer(hwnd_, kRevealFallbackTimer);
+    if (!IsWindowVisible(hwnd_)) {
+        ShowWindow(hwnd_, SW_SHOW);
+    }
+    if (config_.reveal_when_ready) {
+        SetWindowAlpha(255);
+    }
+    UpdateWindow(hwnd_);
+}
+
+void Window::SetWindowAlpha(BYTE alpha) {
+    if (!hwnd_) return;
+    SetLayeredWindowAttributes(hwnd_, 0, alpha, LWA_ALPHA);
 }
 
 void Window::Close() {
