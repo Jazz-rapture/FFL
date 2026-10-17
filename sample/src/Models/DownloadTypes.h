@@ -1,5 +1,8 @@
 #pragma once
 #include <string>
+#include <vector>
+#include <utility>
+#include <cctype>
 #include <atomic>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -72,6 +75,23 @@ struct HttpResult {
     std::string body;
     std::string lastModified;
     int status = 0;
+    // 响应头（已按 CRLF 拆好，名字保留服务端原始大小写）。
+    // 外置登录要靠 X-Authlib-Injector-API-Location 定位真正的 API 根地址
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    // 按名字取响应头，名字大小写不敏感（HTTP 头本来就是大小写不敏感的）
+    std::string GetHeader(const std::string& name) const {
+        std::string lower;
+        lower.reserve(name.size());
+        for (char c : name) lower.push_back((char)tolower((unsigned char)c));
+        for (const auto& h : headers) {
+            std::string key;
+            key.reserve(h.first.size());
+            for (char c : h.first) key.push_back((char)tolower((unsigned char)c));
+            if (key == lower) return h.second;
+        }
+        return "";
+    }
 };
 
 } // namespace Models

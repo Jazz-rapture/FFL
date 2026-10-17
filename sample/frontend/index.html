@@ -20,11 +20,40 @@
 
 <!-- ===== 第一层：登录阶段 ===== -->
 <div class="layer layer-login" id="layerLogin">
+  <!-- 返回：只有从大厅再次进入登录界面时才出现，首次启动没有可返回的对象 -->
+  <button type="button" class="login-back" id="loginBack" hidden>← 返回</button>
   <div class="login-hint" id="loginHint">请登录一个账号以开始使用</div>
   <div class="login-card" id="loginCard">
-    <img class="login-avatar" id="loginAvatar" src="../resoures/icon/nukownP.png" alt="登录头像">
-    <div class="login-input-group">
+    <!-- 登录方式横向导航栏 -->
+    <nav class="login-tabs" id="loginTabs">
+      <button type="button" class="login-tab" data-method="mojang">正版登录</button>
+      <button type="button" class="login-tab" data-method="thirdparty">三方登录</button>
+      <button type="button" class="login-tab active" data-method="offline">离线登录</button>
+    </nav>
+    <!-- 角色图片 -->
+    <div class="login-avatar-wrap">
+      <img class="login-avatar" id="loginAvatar" src="../resoures/icon/steve.png" alt="角色图片">
+    </div>
+    <!-- 仅离线登录需要输入 ID -->
+    <div class="login-input-group" id="loginInputGroup">
       <input type="text" class="login-input" id="loginInput" placeholder="输入您的 ID">
+    </div>
+    <!-- 仅三方登录（外置登录）需要：验证服务器地址 / 用户名 / 密码 -->
+    <div class="login-thirdparty hidden" id="loginThirdParty">
+      <input type="text" class="login-input" id="loginTpUrl" placeholder="验证服务器地址，如 example.com/api/yggdrasil">
+      <input type="text" class="login-input" id="loginTpName" placeholder="用户名 / 邮箱">
+      <input type="password" class="login-input" id="loginTpPassword" placeholder="密码">
+      <div class="login-tp-status" id="loginTpStatus" hidden></div>
+      <div class="login-tp-profiles" id="loginTpProfiles" hidden></div>
+    </div>
+    <!-- 仅正版登录：展示设备代码与进度，不需要任何输入框 -->
+    <div class="login-msa hidden" id="loginMsa">
+      <div class="login-msa-code" id="loginMsaCode" hidden>
+        <span class="login-msa-code-label">在打开的网页中输入此代码</span>
+        <span class="login-msa-code-value" id="loginMsaCodeValue"></span>
+      </div>
+      <div class="login-msa-status" id="loginMsaStatus">点下面的按钮，用浏览器登录微软账号</div>
+      <button type="button" class="login-msa-link" id="loginMsaLink" hidden>重新打开验证页面</button>
     </div>
     <button class="login-btn" id="loginBtn">登录</button>
   </div>
@@ -89,7 +118,14 @@
         </div>
       </div>
       <button type="button" class="account-card-main" id="accountCardMain" aria-expanded="false">
-        <img class="account-card-avatar" id="accountCardAvatar" src="../resoures/icon/nukownP.png" alt="账户头像">
+        <span class="account-card-avatar" id="accountCardAvatar">
+          <!-- 未登录时画一个问号，不再使用 nukownP.png -->
+          <svg class="avatar-unknown" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          <img class="avatar-image" id="accountCardAvatarImg" alt="账户头像">
+        </span>
         <span class="account-card-name" id="accountCardName">未登录</span>
       </button>
     </div>
@@ -103,7 +139,7 @@
         <span>版本</span>
       </button>
     </div>
-    <div class="resource-content" id="resourceContent">
+    <div class="resource-content stagger-in" id="resourceContent">
       <div class="download-loading">
         <p>请选择分类</p>
       </div>
@@ -130,15 +166,50 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
         <span>光影包</span>
       </button>
+      <button type="button" class="sub-sidebar-item" data-category="tasks">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        <span>下载任务</span>
+        <span class="sub-sidebar-badge" id="tasksBadge" hidden></span>
+      </button>
     </div>
 
     <!-- 下载页主内容区 -->
-    <div class="download-content" id="downloadContent">
+    <div class="download-content stagger-in" id="downloadContent">
       <div class="download-loading">
         <div class="download-spinner"></div>
         <p>选择分类查看内容</p>
       </div>
     </div>
+  </div>
+
+  <!-- 联机页内容 -->
+  <div class="lobby-main online-page" id="onlinePage">
+    <!-- 联机页副导航栏 -->
+    <div class="sub-sidebar" id="onlineSubSidebar">
+      <button type="button" class="sub-sidebar-item active" data-category="control">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        <span>联机</span>
+      </button>
+      <button type="button" class="sub-sidebar-item" data-category="tunnels">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 12h16"/><path d="M12 4v16"/></svg>
+        <span>隧道</span>
+      </button>
+      <button type="button" class="sub-sidebar-item" data-category="nodes">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span>节点</span>
+      </button>
+    </div>
+
+    <!-- 联机页主内容区 -->
+    <div class="online-content stagger-in" id="onlineContent">
+      <div class="download-loading">
+        <div class="download-spinner"></div>
+        <p>正在读取联机配置</p>
+      </div>
+    </div>
+
+    <!-- 服务归属提示：常驻在页面底部，不随子视图重绘 -->
+    <button type="button" class="online-attribution" id="onlineAttribution">联机服务由樱花映射（SakuraFrp）提供</button>
   </div>
 
   <!-- 设置页内容 -->
@@ -164,7 +235,7 @@
     </div>
 
     <!-- 设置页主内容区 -->
-    <div class="settings-content" id="settingsContent">
+    <div class="settings-content stagger-in" id="settingsContent">
       <div class="download-loading">
         <p>请选择设置项</p>
       </div>
@@ -173,6 +244,20 @@
 </div>
 
 <div class="custom-tooltip" id="customTooltip"></div>
+
+<!-- 拖放整合包时的全屏提示（原生层收到拖入事件后显示） -->
+<div class="drop-overlay" id="dropOverlay" hidden>
+  <div class="drop-overlay-card">
+    <div class="drop-overlay-arrow"></div>
+    <div class="drop-overlay-title">松开以安装整合包</div>
+    <div class="drop-overlay-hint">支持 Modrinth（.mrpack）与 CurseForge（.zip）</div>
+  </div>
+</div>
+
+<!-- 整合包安装确认卡片（内容由 JS 填充） -->
+<div class="modpack-mask" id="modpackMask" hidden>
+  <div class="modpack-dialog" id="modpackDialog"></div>
+</div>
 
 <!-- 消息提示框容器 -->
 <div class="notification-container" id="notificationContainer"></div>

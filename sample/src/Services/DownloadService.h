@@ -9,6 +9,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/HttpClient.h"
 #include "Core/FileManager.h"
+#include "Core/SegmentedDownloader.h"
 #include "Core/HashUtils.h"
 #include "Core/StringUtils.h"
 #include "Core/DownloadSourceManager.h"
@@ -25,6 +26,26 @@ public:
     }
 
     void SetApp(tauricpp::App* app) { g_app_ptr = app; }
+
+    // ---- 供 ModpackService 复用 ----
+    // 整合包安装要顺带把原版装上，走的必须是和前端同一条管线
+    // （同样的落盘布局、同样的镜像/重试/SHA-1 逻辑），否则装出来的版本
+    // 启动器认不出来。这里把四个 handler 直接暴露出来按 phase 调用，
+    // 参数与对应的 bridge 命令完全一致。
+    // step: "version" | "assets" | "libraries" | "client"
+    nlohmann::json RunStep(const std::string& step, const nlohmann::json& args) {
+        if (step == "version") return HandleVersionDownload(args);
+        if (step == "assets") return HandleAssetsDownload(args);
+        if (step == "libraries") return HandleLibrariesDownload(args);
+        if (step == "client") return HandleClientDownload(args);
+        return {{"ok", false}, {"error", "未知下载步骤: " + step}};
+    }
+
+    // 最近一次进度快照，整合包安装时用来把字节级进度透传给前端
+    nlohmann::json GetLatestProgress() {
+        std::lock_guard<std::mutex> lock(g_latestProgressMtx);
+        return g_latestProgress;
+    }
 
 private:
     // 写入下载日志
@@ -220,6 +241,97 @@ private:
         return result;
     }
 
+    // 下载单个任务到磁盘。
+    // 大文件在连接有余量时走 HTTP Range 多连接分段 —— 镜像普遍按连接限速，
+    // 让一条连接去拉上百 MB 会把它变成整个阶段的尾巴（进度看起来像卡死）。
+    // 连接数由 budget 动态给出（见 SlotBudget），分段失败会自动回退到单连接。
+    // 返回 true 表示已成功落盘并通过 sha1 校验；字节进度由本函数自己累加。
+    bool DownloadOneTask(const Models::DownloadTask& task,
+                         const std::vector<std::string>& allUrls,
+                         Core::SegmentedDownloader::SlotBudget& budget,
+                         const std::string& phase) {
+        // 1) 大文件先试分段。能不能并发由预算决定，这里只判断
+        //    "体积够大" 和 "这个源扛不扛得住并发"
+        const bool try_segments =
+            task.size >= Core::SegmentedDownloader::kMinSizeForSegments && !allUrls.empty() &&
+            Core::SegmentedDownloader::HostAllowsSegments(allUrls.front());
+
+        if (try_segments) {
+            std::atomic<long long> added{0};
+            budget.BeginFile();
+            ULONGLONG seg_last_report = 0;
+            const bool ok = Core::SegmentedDownloader::Download(
+                allUrls, task.savePath, task.size, Core::SegmentedDownloader::kMaxConnections,
+                nullptr,
+                [&](long long bytes) {
+                    added.fetch_add(bytes);
+                    g_progress.AddBytes(bytes);
+                    // 服务端不认 Range 时会退化成逐 16KB 回调，节流一下
+                    const ULONGLONG nowt = GetTickCount64();
+                    if (nowt - seg_last_report >= 500) {
+                        seg_last_report = nowt;
+                        EmitProgress(phase);
+                    }
+                },
+                &budget);
+            budget.EndFile();
+            if (ok) {
+                const std::string actual = Core::HashUtils::ComputeFileSHA1(task.savePath);
+                if (task.expectedSha1.empty() || actual == task.expectedSha1) {
+                    return true;
+                }
+                WriteDownloadLog("SHA-1校验失败(分段) [" + task.name + "] 期望:" +
+                                 task.expectedSha1.substr(0, 8) + " 实际:" + actual.substr(0, 8));
+                DeleteFileW(task.savePath.c_str());
+            }
+            // 分段没成：把已经计入的字节扣回去，否则进度会虚高
+            if (added.load() > 0) g_progress.AddBytes(-added.load());
+        }
+
+        // 2) 单连接（也用作分段失败后的回退）
+        for (const auto& url : allUrls) {
+            // 同样逐块上报进度：单连接下一个大文件在完成前本来是不动的，
+            // 速度会一直显示 0。每 512KB 上报一次即可
+            long long attempt_bytes = 0;
+            ULONGLONG last_report = GetTickCount64();
+            Models::HttpResult res = Core::HttpClient::HttpGet(
+                Core::StringUtils::Utf8ToWide(url), "",
+                [&](long long chunk) {
+                    attempt_bytes += chunk;
+                    g_progress.AddBytes(chunk);
+                    const ULONGLONG nowt = GetTickCount64();
+                    if (nowt - last_report >= 500) {
+                        last_report = nowt;
+                        EmitProgress(phase);
+                    }
+                });
+
+            if (res.status != 200 || res.body.empty()) {
+                if (attempt_bytes > 0) g_progress.AddBytes(-attempt_bytes);
+                continue;
+            }
+            if (!task.expectedSha1.empty() &&
+                Core::HashUtils::ComputeSHA1(res.body) != task.expectedSha1) {
+                if (attempt_bytes > 0) g_progress.AddBytes(-attempt_bytes);
+                continue;
+            }
+            if (Core::FileManager::SaveFile(task.savePath, res.body)) {
+                EmitProgress(phase);
+                return true;
+            }
+            if (attempt_bytes > 0) g_progress.AddBytes(-attempt_bytes);
+        }
+        return false;
+    }
+
+    // 大文件优先排序（LPT）：尾部只会剩小文件，大文件尽早开工
+    static void OrderTasksForDownload(std::vector<Models::DownloadTask>& tasks) {
+        std::stable_sort(tasks.begin(), tasks.end(),
+                         [](const Models::DownloadTask& a, const Models::DownloadTask& b) {
+                             return a.size > b.size;
+                         });
+    }
+
     // 下载版本详情
     nlohmann::json HandleVersionDownload(const nlohmann::json& args) {
         std::string url = args.value("url", "");
@@ -367,8 +479,15 @@ private:
             WriteDownloadLog("文件已存在但SHA-1不匹配, 需要重新下载");
         }
 
+        // 客户端 jar 的体积（前端从版本 JSON 里传过来）。有它才能把进度
+        // 按字节算 —— 只报 totalFiles=1 的话，20 多 MB 的下载全程都是 0%，
+        // 最后一下跳到 100%
+        const long long clientSize =
+            args.contains("size") && args["size"].is_number() ? args["size"].get<long long>() : 0;
+
         g_progress.Reset();
         g_progress.totalFiles = 1;
+        if (clientSize > 0) g_progress.totalBytes = clientSize;
         EmitProgress("client");
 
         const int maxRetries = 3;
@@ -381,6 +500,35 @@ private:
             if (attempt > 0) {
                 WriteDownloadLog("重试下载 (第" + std::to_string(attempt) + "次)...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
+            }
+
+            // 客户端 jar 通常 20+ MB，单连接在限速源上要几分钟。
+            // 体积够大就先试分段（bmclapi 之类不适合并发的源在
+            // SegmentedDownloader 内部会被自动跳过，直接返回 false）。
+            // 分段每写完一块就上报字节，进度条才会平滑前进
+            if (clientSize >= Core::SegmentedDownloader::kMinSizeForSegments) {
+                const bool segmented = Core::SegmentedDownloader::Download(
+                    {url}, savePath, clientSize, Core::SegmentedDownloader::kMaxConnections,
+                    nullptr,
+                    [this](long long added) {
+                        g_progress.AddBytes(added);
+                        EmitProgress("client");
+                    });
+                if (segmented) {
+                    const std::string computedHash = Core::HashUtils::ComputeFileSHA1(savePath);
+                    WriteDownloadLog("分段下载完成, SHA-1: 期望=" + sha1 + " 实际=" + computedHash);
+                    if (sha1.empty() || computedHash == sha1) {
+                        g_progress.completedFiles = 1;
+                        g_progress.downloadedBytes = clientSize;
+                        EmitProgress("client");
+                        WriteDownloadLog("========== 客户端核心JAR下载完成 ==========");
+                        return {{"ok", true}, {"skipped", false}, {"failedFiles", failedArr}};
+                    }
+                    WriteDownloadLog("SHA-1校验失败(分段), 转单连接重试");
+                    DeleteFileW(savePath.c_str());
+                    // 分段已经计入的字节要清掉，否则进度会虚高
+                    g_progress.downloadedBytes = 0;
+                }
             }
 
             Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(url));
@@ -510,6 +658,10 @@ private:
         WriteDownloadLog("  - 已存在(跳过): " + std::to_string(skippedExisting));
         WriteDownloadLog("  - 需要下载: " + std::to_string(assets.size()));
 
+        // 大文件先下（LPT）：尾部只会剩小文件，而不是"最后剩一个几十 MB 的资源
+        // 文件独自慢慢爬"
+        OrderTasksForDownload(assets);
+
         int total = (int)assets.size();
         if (total == 0) {
             WriteDownloadLog("所有资源文件已存在, 无需下载");
@@ -521,6 +673,9 @@ private:
         nlohmann::json cfg;
         try { cfg = nlohmann::json::parse(cfgContent); } catch (...) { cfg = {}; }
         const int maxConcurrent = cfg.value("downloadThreads", 8);
+        // 动态连接预算：同时下载的大文件越少，每个文件分到的连接越多
+        Core::SegmentedDownloader::SlotBudget assetsBudget(
+            Core::SegmentedDownloader::kMaxConnections, maxConcurrent);
 
         WriteDownloadLog("下载配置:");
         WriteDownloadLog("  - 并发线程数: " + std::to_string(maxConcurrent));
@@ -563,6 +718,7 @@ private:
                     }
                 }
 
+
                 bool downloadSuccess = false;
                 for (int attempt = 0; attempt <= task.maxRetries && !downloadSuccess; attempt++) {
                     if (attempt > 0) {
@@ -571,36 +727,18 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(task.retryDelayMs));
                     }
 
-                    // 尝试所有URL
-                    for (size_t j = 0; j < allUrls.size() && !downloadSuccess; j++) {
-                        const auto& url = allUrls[j];
-                        Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(url));
-                        if (res.status == 200 && !res.body.empty()) {
-                            if (!task.expectedSha1.empty()) {
-                                std::string computedHash = Core::HashUtils::ComputeSHA1(res.body);
-                                if (computedHash != task.expectedSha1) {
-                                    WriteDownloadLog("SHA-1校验失败 [" + std::to_string(i + 1) + "/" + std::to_string(total) + "]: " +
-                                                    task.name + " 期望:" + task.expectedSha1.substr(0, 8) +
-                                                    " 实际:" + computedHash.substr(0, 8));
-                                    continue;
-                                }
-                            }
-                            if (Core::FileManager::SaveFile(task.savePath, res.body)) {
-                                downloadSuccess = true;
-                                std::lock_guard<std::mutex> lock(mtx);
-                                downloaded++;
-                                g_progress.completedFiles++;
-                                g_progress.AddBytes(res.body.size());
+                    // 大文件走 Range 分段，小的走单连接；字节进度由它自己累加
+                    downloadSuccess = DownloadOneTask(task, allUrls, assetsBudget, "assets");
+                    if (downloadSuccess) {
+                        std::lock_guard<std::mutex> lock(mtx);
+                        downloaded++;
+                        g_progress.completedFiles++;
 
-                                int currentProgress = progressCounter.fetch_add(1);
-                                if ((currentProgress + 1) % 100 == 0 || (currentProgress + 1) == total) {
-                                    WriteDownloadLog("下载进度: " + std::to_string(currentProgress + 1) + "/" + std::to_string(total) +
-                                                    " (" + std::to_string((currentProgress + 1) * 100 / total) + "%)" +
-                                                    " 成功:" + std::to_string(downloaded) + " 失败:" + std::to_string(failed));
-                                }
-
-                                EmitProgress("assets");
-                            }
+                        int currentProgress = progressCounter.fetch_add(1);
+                        if ((currentProgress + 1) % 100 == 0 || (currentProgress + 1) == total) {
+                            WriteDownloadLog("下载进度: " + std::to_string(currentProgress + 1) + "/" + std::to_string(total) +
+                                            " (" + std::to_string((currentProgress + 1) * 100 / total) + "%)" +
+                                            " 成功:" + std::to_string(downloaded) + " 失败:" + std::to_string(failed));
                         }
                     }
                 }
@@ -875,6 +1013,9 @@ private:
         WriteDownloadLog("    - 已存在且完整: " + std::to_string(skippedExisting));
         WriteDownloadLog("    - 无下载URL: " + std::to_string(skippedNoUrl));
 
+        OrderTasksForDownload(toDownload);
+
+
         int total = (int)toDownload.size();
         if (total == 0) {
             WriteDownloadLog("所有库文件已存在, 无需下载");
@@ -894,7 +1035,9 @@ private:
         nlohmann::json cfg2;
         try { cfg2 = nlohmann::json::parse(cfgContent2); } catch (...) { cfg2 = {}; }
         const int maxConcurrent2 = cfg2.value("downloadThreads", 8);
-
+        // 动态连接预算：同时下载的大文件越少，每个文件分到的连接越多
+        Core::SegmentedDownloader::SlotBudget libBudget(
+            Core::SegmentedDownloader::kMaxConnections, maxConcurrent2);
         WriteDownloadLog("下载配置:");
         WriteDownloadLog("  - 并发线程数: " + std::to_string(maxConcurrent2));
         WriteDownloadLog("  - 最大重试次数: 3");
@@ -942,44 +1085,21 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(task.retryDelayMs));
                     }
 
-                    // 尝试所有URL
-                    for (size_t j = 0; j < allUrls.size() && !downloadSuccess; j++) {
-                        const auto& url = allUrls[j];
-                        WriteDownloadLog("[下载请求] [" + std::to_string(i + 1) + "/" + std::to_string(total) + "] " +
-                                        task.name + " -> " + url);
-                        Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(url));
-                        WriteDownloadLog("[下载响应] [" + std::to_string(i + 1) + "/" + std::to_string(total) + "] " +
-                                        task.name + " status=" + std::to_string(res.status) +
-                                        " size=" + std::to_string(res.body.size()));
-                        if (res.status == 200 && !res.body.empty()) {
-                            if (!task.expectedSha1.empty()) {
-                                std::string computedHash = Core::HashUtils::ComputeSHA1(res.body);
-                                if (computedHash != task.expectedSha1) {
-                                    WriteDownloadLog("SHA-1校验失败 [" + std::to_string(i + 1) + "/" + std::to_string(total) + "]: " +
-                                                    task.name + " 期望:" + task.expectedSha1.substr(0, 8) +
-                                                    " 实际:" + computedHash.substr(0, 8));
-                                    continue;
-                                }
-                            }
-                            if (Core::FileManager::SaveFile(task.savePath, res.body)) {
-                                downloadSuccess = true;
-                                std::lock_guard<std::mutex> lock(mtx2);
-                                downloaded++;
-                                if (task.resourceType == Models::ResourceType::FORGE) {
-                                    forgeDownloaded++;
-                                }
-                                g_progress.completedFiles++;
-                                g_progress.AddBytes(res.body.size());
+                    // 大文件走 Range 分段，小的走单连接；字节进度由它自己累加
+                    downloadSuccess = DownloadOneTask(task, allUrls, libBudget, "libraries");
+                    if (downloadSuccess) {
+                        std::lock_guard<std::mutex> lock(mtx2);
+                        downloaded++;
+                        if (task.resourceType == Models::ResourceType::FORGE) {
+                            forgeDownloaded++;
+                        }
+                        g_progress.completedFiles++;
 
-                                int currentProgress = progressCounter2.fetch_add(1);
-                                if ((currentProgress + 1) % 50 == 0 || (currentProgress + 1) == total) {
-                                    WriteDownloadLog("下载进度: " + std::to_string(currentProgress + 1) + "/" + std::to_string(total) +
-                                                    " (" + std::to_string((currentProgress + 1) * 100 / total) + "%)" +
-                                                    " 成功:" + std::to_string(downloaded) + " 失败:" + std::to_string(failed));
-                                }
-
-                                EmitProgress("libraries");
-                            }
+                        int currentProgress = progressCounter2.fetch_add(1);
+                        if ((currentProgress + 1) % 50 == 0 || (currentProgress + 1) == total) {
+                            WriteDownloadLog("下载进度: " + std::to_string(currentProgress + 1) + "/" + std::to_string(total) +
+                                            " (" + std::to_string((currentProgress + 1) * 100 / total) + "%)" +
+                                            " 成功:" + std::to_string(downloaded) + " 失败:" + std::to_string(failed));
                         }
                     }
                 }

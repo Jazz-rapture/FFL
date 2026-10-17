@@ -17,6 +17,16 @@ public:
         RegisterCommands();
     }
 
+    // 供 ModpackService 复用：把装好的版本登记进 config.json（等价于 version.save）
+    static nlohmann::json SaveVersionEntry(const nlohmann::json& args) {
+        return HandleSaveVersion(args);
+    }
+
+    // 供 ModpackService 复用：重新扫描 versions 目录并回写 config.json
+    static nlohmann::json ScanInstalledVersions() {
+        return HandleGetInstalledVersions();
+    }
+
 private:
     void RegisterCommands() {
         // version.list - 获取版本列表
@@ -80,6 +90,61 @@ private:
                 profileName = config["game"].value("selectedVersion", "");
             }
             return {{"ok", true}, {"profileName", profileName}};
+        });
+
+        // version.togglePinned - 固定 / 取消固定到主页
+        // 主页左下角的版本卡片只列固定的版本，列表存在 game.pinnedVersions 里。
+        // 不放在 game.versions 的条目内：version.getInstalled 会按磁盘扫描结果
+        // 整体重建 game.versions，写在里面的标记会被冲掉。
+        bridge_.RegisterCommand("version.togglePinned", [](const nlohmann::json& args) -> nlohmann::json {
+            std::string profileName = args.value("profileName", "");
+            if (profileName.empty()) {
+                return {{"ok", false}, {"error", "Missing profileName"}};
+            }
+
+            std::string content = Core::ConfigManager::ReadConfigFile();
+            nlohmann::json config;
+            try {
+                config = nlohmann::json::parse(content);
+            } catch (...) {
+                config = nlohmann::json::object();
+            }
+
+            if (!config.contains("game") || !config["game"].is_object()) {
+                config["game"] = nlohmann::json::object();
+            }
+            if (!config["game"].contains("pinnedVersions") ||
+                !config["game"]["pinnedVersions"].is_array()) {
+                config["game"]["pinnedVersions"] = nlohmann::json::array();
+            }
+
+            bool wasPinned = false;
+            nlohmann::json newPinned = nlohmann::json::array();
+            for (const auto& item : config["game"]["pinnedVersions"]) {
+                if (item.is_string() && item.get<std::string>() == profileName) {
+                    wasPinned = true;
+                    continue;
+                }
+                newPinned.push_back(item);
+            }
+
+            // 传了 pinned 就按给定值写，没传就在当前状态上取反
+            bool pinned = !wasPinned;
+            if (args.contains("pinned") && args["pinned"].is_boolean()) {
+                pinned = args["pinned"].get<bool>();
+            }
+
+            if (pinned && (int)newPinned.size() >= Core::ConfigManager::kMaxPinnedVersions) {
+                return {{"ok", false},
+                        {"error", std::string("最多只能固定 ") +
+                                      std::to_string(Core::ConfigManager::kMaxPinnedVersions) +
+                                      " 个版本，请先取消一个"}};
+            }
+            if (pinned) newPinned.push_back(profileName);
+
+            config["game"]["pinnedVersions"] = newPinned;
+            bool ok = Core::ConfigManager::WriteConfigFile(config.dump(4));
+            return {{"ok", ok}, {"pinned", pinned}};
         });
 
         // ignorelist.get - 获取忽略库列表
@@ -328,7 +393,13 @@ private:
         config["game"]["versions"] = mergedVersions;
         Core::ConfigManager::WriteConfigFile(config.dump(4));
 
-        return {{"ok", true}, {"versions", mergedVersions}};
+        // 固定列表只是 profileName 的数组，getInstalled 不会重建它，原样带出去
+        nlohmann::json pinned = nlohmann::json::array();
+        if (config["game"].contains("pinnedVersions") && config["game"]["pinnedVersions"].is_array()) {
+            pinned = config["game"]["pinnedVersions"];
+        }
+
+        return {{"ok", true}, {"versions", mergedVersions}, {"pinned", pinned}};
     }
 
     // 删除版本
@@ -368,6 +439,17 @@ private:
         if (config.contains("game") && config["game"].is_object()) {
             if (config["game"].value("selectedVersion", "") == profileName) {
                 config["game"]["selectedVersion"] = "";
+            }
+
+            // 版本没了，它的固定项也要一起清掉，否则主页卡片会留下点不动的空条目
+            if (config["game"].contains("pinnedVersions") && config["game"]["pinnedVersions"].is_array()) {
+                nlohmann::json newPinned = nlohmann::json::array();
+                for (const auto& item : config["game"]["pinnedVersions"]) {
+                    if (item.is_string() && item.get<std::string>() != profileName) {
+                        newPinned.push_back(item);
+                    }
+                }
+                config["game"]["pinnedVersions"] = newPinned;
             }
         }
 

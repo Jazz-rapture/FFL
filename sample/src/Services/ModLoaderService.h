@@ -47,6 +47,13 @@ public:
         RegisterCommands();
     }
 
+    // 供 ModpackService 复用：同步安装加载器。
+    // modloader.install 命令外壳自己起了线程 + 走 poll，这里要的是同步语义，
+    // 因为整合包安装本身已经工作在后台线程上
+    nlohmann::json InstallLoaderSync(const nlohmann::json& args) {
+        return HandleInstall(args);
+    }
+
 private:
     Bridge::WebviewBridge& bridge_;
 
@@ -287,6 +294,24 @@ private:
             return -1;
         }
 
+        // 把子进程放进一个 KILL_ON_JOB_CLOSE 的 Job 里。
+        // 不这么做的话，启动器一旦被强制关闭（崩溃、任务管理器结束、用户点关闭），
+        // 这些 java 处理器就会变成孤儿一直活着 —— 而 Forge 的 binarypatcher
+        // 会锁着它正在写的 client.jar，导致之后每一次安装都在
+        // "Could not delete output file" 上失败，且永远无法自愈。
+        // 把 Job 句柄随进程关闭，系统会连带结束里面所有子进程。
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = {};
+            jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                         &jobInfo, sizeof(jobInfo)) ||
+                !AssignProcessToJobObject(job, pi.hProcess)) {
+                CloseHandle(job);
+                job = nullptr;
+            }
+        }
+
         std::string collected;
         DWORD waitStart = GetTickCount();
         bool timedOut = false;
@@ -326,6 +351,7 @@ private:
         GetExitCodeProcess(pi.hProcess, &exitCode);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+        if (job) CloseHandle(job);  // 子进程已退出，关掉 Job 即可
         if (timedOut) return -2;
         return (int)exitCode;
     }
@@ -798,10 +824,15 @@ private:
         return Core::FileManager::SaveFile(dir + L"\\" + Utf8ToWide(profileName) + L".json", versionJson.dump(2));
     }
 
-    // 查找原版客户端 jar：优先 versions/<profileName>/<gameVersion>.jar，否则全盘扫描
+    // 查找原版客户端 jar：优先 versions/<gameVersion>/<gameVersion>.jar（标准布局），
+    // 其次是 versions/<profileName>/<gameVersion>.jar（早期版本我们自己的布局），
+    // 最后全盘扫描
     static std::wstring FindVanillaJar(const std::string& profileName, const std::string& gameVersion) {
         std::wstring versionsDir = MinecraftDir() + L"\\versions";
         std::wstring jarName = Utf8ToWide(gameVersion) + L".jar";
+
+        std::wstring standard = versionsDir + L"\\" + Utf8ToWide(gameVersion) + L"\\" + jarName;
+        if (Core::FileManager::FileExists(standard)) return standard;
 
         std::wstring direct = versionsDir + L"\\" + Utf8ToWide(profileName) + L"\\" + jarName;
         if (Core::FileManager::FileExists(direct)) return direct;
@@ -1351,6 +1382,19 @@ private:
                 if (exitCode != 0) {
                     std::string reason = exitCode == -2 ? "执行超时" : "退出码 " + std::to_string(exitCode);
                     cleanup();
+
+                    // binarypatcher 之类的处理器会先删掉输出文件再写新的。删不掉
+                    // 只有一个原因：那个 jar 正被别的进程占着 —— 典型的场景是
+                    // 上一次安装跑到一半时启动器被关掉，它的 java 子进程变成孤儿
+                    // 一直活着。Forge 只会甩一句 "Could not delete output file"，
+                    // 用户完全没法据此处理，所以这里换成能照着做的提示。
+                    if (output.find("Could not delete output file") != std::string::npos) {
+                        return {{"ok", false},
+                                {"error", loaderName + " 安装被中断：有个残留的 Java 进程正占用安装文件。\n"
+                                          "这通常是上次安装到一半时启动器被强制关闭导致的。\n"
+                                          "请先在任务管理器里结束多余的 java.exe 进程，然后重试。\n\n" +
+                                              TailLines(output, 3)}};
+                    }
                     return {{"ok", false},
                             {"error", loaderName + " 处理器执行失败 (" + reason + "): " + TailLines(output, 6)}};
                 }

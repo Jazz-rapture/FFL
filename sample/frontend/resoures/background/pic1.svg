@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="1920" height="1080" viewBox="0 0 1920 1080">
+  <!--
+    启动器背景图（矢量）。
+    底色 = 原 CSS linear-gradient(135deg,#667eea,#764ba2)。
+    线条是手写的贝塞尔路径，全部沿同一个"流场"走：整体自左下向右上涌流，
+    越往上弯折点越靠右，于是线条自然成束、疏密相间；
+    再叠少量交叉长弧与细碎光段，色彩沿流向由青推到粉。
+  -->
+  <defs>
+    <!-- ===== 底色渐变 ===== -->
+    <linearGradient id="base" gradientUnits="userSpaceOnUse" x1="210" y1="-210" x2="1710" y2="1290">
+      <stop offset="0" stop-color="#667eea"/>
+      <stop offset="1" stop-color="#764ba2"/>
+    </linearGradient>
+
+    <!-- ===== 色彩场：沿流向 青 → 天蓝 → 蓝紫 → 紫丁香 → 粉 ===== -->
+    <linearGradient id="hueA" gradientUnits="userSpaceOnUse" x1="-120" y1="0" x2="2040" y2="0">
+      <stop offset="0.00" stop-color="#7fe3ff"/>
+      <stop offset="0.26" stop-color="#9fd6ff"/>
+      <stop offset="0.52" stop-color="#bcaaff"/>
+      <stop offset="0.76" stop-color="#d89ef5"/>
+      <stop offset="1.00" stop-color="#ffa6d8"/>
+    </linearGradient>
+    <linearGradient id="hueB" gradientUnits="userSpaceOnUse" x1="-120" y1="0" x2="2040" y2="0">
+      <stop offset="0.00" stop-color="#8fe4f5"/>
+      <stop offset="0.30" stop-color="#a8c8ff"/>
+      <stop offset="0.58" stop-color="#c2a4ff"/>
+      <stop offset="0.82" stop-color="#e6a2ee"/>
+      <stop offset="1.00" stop-color="#ffb0cf"/>
+    </linearGradient>
+
+    <!-- ===== 光段的两端渐隐：按各自的包围盒取值，所以每条线都在自己两端消散 ===== -->
+    <linearGradient id="ends" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0.00" stop-color="#000000"/>
+      <stop offset="0.18" stop-color="#ffffff"/>
+      <stop offset="0.84" stop-color="#ffffff"/>
+      <stop offset="1.00" stop-color="#000000"/>
+    </linearGradient>
+    <mask id="fade" maskContentUnits="objectBoundingBox">
+      <rect x="0" y="0" width="1" height="1" fill="url(#ends)"/>
+    </mask>
+
+    <!-- ===== 辉光 ===== -->
+    <filter id="glowWide" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="56"/>
+    </filter>
+    <filter id="glowSoft" x="-15%" y="-15%" width="130%" height="130%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+    <filter id="glowMid" x="-15%" y="-15%" width="130%" height="130%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+    <filter id="calmBlur" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="90"/>
+    </filter>
+
+    <!-- ===== 中区安静蒙版：UI 卡片所在处线条减弱 ===== -->
+    <mask id="calm" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect width="1920" height="1080" fill="#ffffff"/>
+      <g filter="url(#calmBlur)">
+        <ellipse cx="1040" cy="560" rx="470" ry="300" fill="#000000" opacity="0.5"/>
+        <ellipse cx="1040" cy="560" rx="760" ry="470" fill="#000000" opacity="0.28"/>
+      </g>
+    </mask>
+
+    <!-- ===== 暗角 ===== -->
+    <radialGradient id="vig" gradientUnits="userSpaceOnUse" cx="960" cy="540" r="1100">
+      <stop offset="0.42" stop-color="#0b1030" stop-opacity="0"/>
+      <stop offset="1.00" stop-color="#0b1030" stop-opacity="0.2"/>
+    </radialGradient>
+
+    <!-- ===== 线条层 ===== -->
+    <g id="lines" fill="none" stroke-linecap="round" stroke-linejoin="round">
+
+      <!-- 宽幅光带：把"流向"铺成一片丝质光雾 -->
+      <path d="M -120 1080 C 360 1140, 900 1000, 1300 880 S 1780 700, 2040 640"
+            stroke="url(#hueA)" stroke-width="58" opacity="0.07"/>
+      <path d="M -120 760 C 380 820, 940 660, 1340 540 S 1800 360, 2040 300"
+            stroke="url(#hueB)" stroke-width="52" opacity="0.062"/>
+      <path d="M -120 430 C 400 490, 960 330, 1360 210 S 1820 20, 2040 -40"
+            stroke="url(#hueA)" stroke-width="46" opacity="0.056"/>
+
+      <!-- 主流：同一条流场，弯折点逐层右移，越靠上越早离画 -->
+      <path d="M -120 1120 C 300 1180, 560 1080, 760 1000 S 1420 700, 2040 600"
+            stroke="url(#hueA)" stroke-width="5" opacity="0.42"/>
+      <path d="M -120 1030 C 340 1090, 600 990, 830 910 S 1480 610, 2040 500"
+            stroke="url(#hueB)" stroke-width="2.2" opacity="0.58"/>
+      <path d="M -120 940 C 320 1000, 620 900, 900 820 S 1540 520, 2040 400"
+            stroke="url(#hueA)" stroke-width="2.6" opacity="0.24"/>
+      <path d="M -120 850 C 360 910, 660 810, 970 730 S 1600 430, 2040 300"
+            stroke="url(#hueB)" stroke-width="4" opacity="0.36"/>
+      <path d="M -120 760 C 340 820, 700 720, 1040 640 S 1660 340, 2040 200"
+            stroke="url(#hueA)" stroke-width="5.2" opacity="0.44"/>
+      <path d="M -120 670 C 360 730, 720 630, 1100 550 S 1720 250, 2040 110"
+            stroke="url(#hueB)" stroke-width="2" opacity="0.6"/>
+      <path d="M -120 580 C 340 640, 740 540, 1160 460 S 1780 160, 2040 20"
+            stroke="url(#hueA)" stroke-width="3.6" opacity="0.34"/>
+      <path d="M -120 490 C 360 550, 760 450, 1200 370 S 1820 70, 2040 -70"
+            stroke="url(#hueB)" stroke-width="4.8" opacity="0.42"/>
+      <path d="M -120 400 C 340 460, 780 360, 1240 280 S 1840 -20, 2040 -160"
+            stroke="url(#hueA)" stroke-width="2.4" opacity="0.22"/>
+      <path d="M -120 310 C 360 370, 800 270, 1270 190 S 1860 -110, 2040 -250"
+            stroke="url(#hueB)" stroke-width="2.2" opacity="0.56"/>
+      <path d="M -120 220 C 340 280, 820 180, 1300 100 S 1880 -200, 2040 -340"
+            stroke="url(#hueA)" stroke-width="2.8" opacity="0.26"/>
+      <path d="M -120 130 C 360 190, 840 90, 1330 10 S 1900 -290, 2040 -430"
+            stroke="url(#hueB)" stroke-width="3.4" opacity="0.3"/>
+
+      <!-- 低位弧：压住右下角，并在这里和主流交叉 -->
+      <path d="M -120 1230 C 430 1160, 950 1260, 1350 1100 S 1810 950, 2040 1000"
+            stroke="url(#hueA)" stroke-width="3" opacity="0.3"/>
+      <path d="M -120 1120 C 380 1230, 880 1100, 1280 1060 S 1780 900, 2040 840"
+            stroke="url(#hueB)" stroke-width="2.4" opacity="0.26"/>
+      <path d="M -120 1300 C 500 1230, 1050 1080, 1450 880 S 1840 640, 2040 560"
+            stroke="url(#hueA)" stroke-width="2.6" opacity="0.24"/>
+
+      <!-- 下降线：与主流反向，制造张力 -->
+      <path d="M -120 150 C 420 280, 860 90, 1280 240 S 1760 400, 2040 350"
+            stroke="url(#hueB)" stroke-width="2.8" opacity="0.26"/>
+
+      <!-- 交叉长弧：压低在底层，只作编织感 -->
+      <path d="M 220 -120 C 460 300, 760 620, 1120 1000 S 1420 1180, 1700 1240"
+            stroke="url(#hueA)" stroke-width="2.2" opacity="0.15"/>
+      <path d="M -170 220 C 280 540, 700 830, 1200 1120"
+            stroke="url(#hueB)" stroke-width="2" opacity="0.13"/>
+      <path d="M 1180 -120 C 1300 300, 1560 600, 1880 1180"
+            stroke="url(#hueA)" stroke-width="2.4" opacity="0.15"/>
+      <path d="M 760 1220 C 1000 950, 1160 560, 1560 200 S 1880 -40, 2060 -110"
+            stroke="url(#hueB)" stroke-width="2.2" opacity="0.14"/>
+
+      <!-- 细碎光段：贴着流向的短促亮丝，两端各自消散 -->
+      <path d="M 130 1085 C 250 1065, 420 1005, 650 950" stroke="url(#hueA)" stroke-width="1.9" opacity="0.78" mask="url(#fade)"/>
+      <path d="M 150 885 C 270 863, 430 805, 655 750" stroke="url(#hueB)" stroke-width="1.6" opacity="0.66" mask="url(#fade)"/>
+      <path d="M 140 645 C 260 623, 420 565, 645 510" stroke="url(#hueA)" stroke-width="2.1" opacity="0.74" mask="url(#fade)"/>
+      <path d="M 160 405 C 280 383, 440 325, 660 270" stroke="url(#hueB)" stroke-width="1.7" opacity="0.7" mask="url(#fade)"/>
+      <path d="M 145 200 C 265 178, 425 120, 640 65" stroke="url(#hueA)" stroke-width="1.6" opacity="0.6" mask="url(#fade)"/>
+      <path d="M 665 1005 C 790 983, 960 923, 1195 870" stroke="url(#hueB)" stroke-width="1.8" opacity="0.76" mask="url(#fade)"/>
+      <path d="M 675 775 C 800 753, 965 693, 1200 640" stroke="url(#hueA)" stroke-width="1.6" opacity="0.68" mask="url(#fade)"/>
+      <path d="M 660 540 C 785 518, 950 458, 1185 405" stroke="url(#hueB)" stroke-width="2.1" opacity="0.8" mask="url(#fade)"/>
+      <path d="M 680 300 C 805 278, 970 218, 1200 165" stroke="url(#hueA)" stroke-width="1.7" opacity="0.72" mask="url(#fade)"/>
+      <path d="M 1185 915 C 1315 893, 1485 833, 1720 780" stroke="url(#hueA)" stroke-width="1.9" opacity="0.8" mask="url(#fade)"/>
+      <path d="M 1195 675 C 1325 653, 1495 593, 1725 540" stroke="url(#hueB)" stroke-width="1.6" opacity="0.68" mask="url(#fade)"/>
+      <path d="M 1190 435 C 1320 413, 1490 353, 1720 300" stroke="url(#hueA)" stroke-width="2.1" opacity="0.76" mask="url(#fade)"/>
+      <path d="M 1200 195 C 1330 173, 1500 113, 1725 60" stroke="url(#hueB)" stroke-width="1.7" opacity="0.7" mask="url(#fade)"/>
+      <path d="M 1180 1000 C 1310 978, 1480 918, 1715 865" stroke="url(#hueA)" stroke-width="1.7" opacity="0.64" mask="url(#fade)"/>
+      <path d="M 1575 830 C 1685 812, 1825 760, 2035 715" stroke="url(#hueB)" stroke-width="1.8" opacity="0.78" mask="url(#fade)"/>
+      <path d="M 1585 600 C 1695 582, 1835 530, 2040 485" stroke="url(#hueA)" stroke-width="1.6" opacity="0.7" mask="url(#fade)"/>
+      <path d="M 1590 370 C 1700 352, 1840 300, 2040 255" stroke="url(#hueB)" stroke-width="1.9" opacity="0.74" mask="url(#fade)"/>
+      <path d="M 1600 140 C 1710 122, 1850 70, 2040 25" stroke="url(#hueA)" stroke-width="1.6" opacity="0.66" mask="url(#fade)"/>
+      <path d="M 1570 980 C 1680 962, 1820 910, 2030 865" stroke="url(#hueB)" stroke-width="1.9" opacity="0.72" mask="url(#fade)"/>
+
+      <!-- 沿途光点 -->
+      <circle cx="300" cy="640" r="3.2" fill="#ffffff" opacity="0.35"/>
+      <circle cx="505" cy="850" r="2.4" fill="#ffffff" opacity="0.28"/>
+      <circle cx="735" cy="470" r="3.6" fill="#ffffff" opacity="0.4"/>
+      <circle cx="1120" cy="640" r="2.6" fill="#ffffff" opacity="0.3"/>
+      <circle cx="1290" cy="250" r="3.4" fill="#ffffff" opacity="0.38"/>
+      <circle cx="1500" cy="870" r="2.8" fill="#ffffff" opacity="0.3"/>
+      <circle cx="1720" cy="520" r="3.2" fill="#ffffff" opacity="0.34"/>
+      <circle cx="620" cy="1050" r="2.2" fill="#ffffff" opacity="0.26"/>
+      <circle cx="980" cy="140" r="2.6" fill="#ffffff" opacity="0.3"/>
+      <circle cx="1850" cy="760" r="3" fill="#ffffff" opacity="0.32"/>
+    </g>
+  </defs>
+
+  <!-- 底色 -->
+  <rect width="1920" height="1080" fill="url(#base)"/>
+
+  <!-- 线条：光雾 → 散射光 → 柔光 → 清晰 -->
+  <g mask="url(#calm)">
+    <use xlink:href="#lines" href="#lines" filter="url(#glowWide)" opacity="0.2"/>
+    <use xlink:href="#lines" href="#lines" filter="url(#glowSoft)" opacity="0.3"/>
+    <use xlink:href="#lines" href="#lines" filter="url(#glowMid)" opacity="0.42"/>
+    <use xlink:href="#lines" href="#lines"/>
+  </g>
+
+  <!-- 暗角 -->
+  <rect width="1920" height="1080" fill="url(#vig)"/>
+</svg>

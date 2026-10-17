@@ -1,0 +1,153 @@
+# Mod 中文译名表
+#
+# 格式：<Modrinth slug>|<中文名>，一行一条，# 开头是注释。
+# 也兼容 PCL 的 WikiEntries.txt 格式（用 ¨ 分隔同行多个别名、用 @ 区分平台），
+# 所以你想换成更全的译名库时，直接把这个文件的内容替换掉即可 —— 本文件不随
+# 启动器分发任何第三方译名数据，替换成什么由你自己决定。
+#
+# 查表按 slug 精确匹配，页面会同时显示中文名和原英文名，查不到就只显示英文名。
+
+# ---- 优化 / 性能 ----
+sodium|钠
+lithium|锂
+phosphor|磷
+krypton|氪
+starlight|星光
+ferrite-core|铁氧体核心
+lazydfu|LazyDFU
+memoryleakfix|内存泄漏修复
+modernfix|现代化修复
+entityculling|实体渲染优化
+moreculling|更多剔除
+dynamic-fps|动态帧率
+c2me-fabric|C2ME 并发区块管理
+indium|铟
+sodium-extra|钠扩展
+embeddium|Embeddium 渲染优化
+rubidium|铷
+radium|镭
+iris|Iris 光影加载器
+oculus|Oculus 光影加载器
+optifine|OptiFine 高清修复
+
+# ---- 前置库 / API ----
+fabric-api|Fabric API
+architectury-api|Architectury API
+cloth-config|Cloth Config API
+modmenu|Mod 菜单
+mouse-tweaks|鼠标调整
+controlling|Controlling 搜索
+catalogue|Catalogue 模组目录
+configured|Configured 配置菜单
+searchables|Searchables 搜索框
+fabric-language-kotlin|Fabric Language Kotlin
+trinkets|Trinkets 饰品栏
+curios|Curios 饰品栏
+kubejs|KubeJS 脚本
+crafttweaker|CraftTweaker 脚本
+ftb-library-fabric|FTB Library
+ftb-quests-fabric|FTB 任务
+ftb-teams-fabric|FTB 队伍
+ftb-chunks-fabric|FTB 区块
+
+# ---- 信息显示 / 便利 ----
+jei|JEI 物品管理器
+roughly-enough-items|REI 物品管理器
+emi|EMI 物品管理器
+appleskin|苹果皮
+jade|Jade 信息显示
+wthit|WTHIT 信息显示
+hwyla|HWYLA 信息显示
+journeymap|旅行地图
+xaeros-minimap|Xaero 的小地图
+xaeros-world-map|Xaero 的世界地图
+betterf3|更好的 F3
+toast-control|Toast 控制
+better-advancements|更好的进度
+natures-compass|自然指南针
+right-click-harvest|右键收获
+comforts|睡袋
+corail-tombstone|Corail 墓碑
+
+# ---- 物流 / 存储 ----
+iron-chests|铁箱子
+storagedrawers|储物抽屉
+toms-storage|Tom 的简易存储
+sophisticated-backpacks|精致背包
+travelers-backpack|旅行者背包
+carry-on|搬运
+waystones|传送石碑
+corpse|尸体
+gravestone-mod|墓碑
+refined-storage|精致存储
+extra-storage|扩展存储
+integrated-dynamics|集成动力
+
+# ---- 大型内容模组 ----
+create|机械动力
+appliedenergistics2|应用能源2
+botania|植物魔法
+thermal-expansion|热力膨胀
+immersive-engineering|沉浸工程
+mekanism|通用机械
+industrial-craft|工业时代2
+buildcraft|建筑
+forestry|林业
+railcraft-reborn|铁路
+tinkers-construct|匠魂
+twilightforest|暮色森林
+biomes-o-plenty|超多生物群系
+oh-the-biomes-youll-go|你将去的生物群系
+quark|夸克
+ars-nouveau|新生魔艺
+blood-magic|血魔法
+mystical-agriculture|神秘农业
+aether|天境
+rats|老鼠
+cobblemon|方块宝可梦
+pixelmon|精灵宝可梦
+alexs-mobs|Alex 的生物
+ice-and-fire|冰火传说
+supplementaries|增补
+farmers-delight|农夫乐事
+croptopia|作物盛景
+aquaculture|水产养殖
+serene-seasons|静谧四季
+betterend|更好的末地
+betternether|更好的下界
+architects-palette|建筑师调色板
+chipped|Chipped 方块变体
+macaws-furniture|Macaw 的家具
+macaws-bridges|Macaw 的桥
+macaws-doors|Macaw 的门
+macaws-trapdoors|Macaw 的活板门
+macaws-roofs|Macaw 的屋顶
+macaws-fences-and-walls|Macaw 的栅栏与墙
+macaws-paths-and-pavings|Macaw 的道路与铺装
+
+# ---- 光影 ----
+complementary-reimagined|Complementary 光影 - 重制版
+complementary-unbound|Complementary 光影 - 解放
+complementary-shaders|Complementary 光影
+bsl-shaders|BSL 光影
+photon-shader|Photon 光影
+solas-shaders|Solas 光影
+rethinking-voxels|Rethinking Voxels 光影
+makeup-ultra-fast-shaders|MakeUp 光影
+super-duper-vanilla|Super Duper Vanilla 光影
+chocapic13-shaders|Chocapic13 光影
+nostalgia-shaders|Nostalgia 光影
+kappa-shaders|Kappa 光影
+insanity-shaders|Insanity 光影
+bliss-shader|Bliss 光影
+mellow-shader|Mellow 光影
+euphoria-patches|Euphoria Patches 光影扩展
+spooklementary|Spooklementary 光影
+
+# ---- 资源包 ----
+fresh-animations|Fresh Animations 生动动画
+faithful-32x|Faithful 32x 原版风格
+stay-true|Stay True
+motschens-better-leaves|Motschen 的更好的树叶
+xalis-enchanted-books|Xali 的附魔书
+cubic-sun-moon|立方体太阳与月亮

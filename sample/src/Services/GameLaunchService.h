@@ -2,9 +2,13 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <sstream>
+#include <cmath>
+#include <algorithm>
+#include <regex>
 #include <Windows.h>
 #include <shlobj.h>
 #include <nlohmann/json.hpp>
@@ -16,6 +20,9 @@
 #include "Core/DownloadSourceManager.h"
 #include "Bridge/WebviewBridge.h"
 #include "Services/MavenUtils.h"
+#include "Services/MsaAuthService.h"
+#include "Services/YggdrasilAuthService.h"
+#include "Core/AuthlibInjector.h"
 #include "Core/ZipExtractor.h"
 
 namespace Services {
@@ -27,6 +34,76 @@ public:
     }
 
     void SetApp(tauricpp::App* app) { g_app_ptr = app; }
+
+    // 当前选中版本的游戏目录，以及 mod / 资源包 / 光影包 各自的落点。
+    // 前端的「另存为」用它当默认目录，语义与 PCL 的 PathIndie 一致：
+    // 开了版本隔离就落在 versions 下的版本文件夹，否则是 .minecraft 本身
+    static nlohmann::json GetResourcePaths() {
+        nlohmann::json config = ReadConfig();
+
+        GameSettings settings = ReadGameSettings(config);
+        std::string profileName;
+        bool isModded = false;
+        std::wstring gameDir;
+        ResolveSelectedVersion(config, settings, profileName, isModded, gameDir);
+
+        // 加载器版本的 id 是 profileName（可能是 "1.20.1-forge-47.2.0" 甚至用户改名后的
+        // 任意字符串），真正的游戏版本在 inheritsFrom 里。前端拿它标记「所选版本」
+        nlohmann::json vj = ReadVersionJson(profileName);
+        std::string gameVersion = profileName;
+        if (vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string()) {
+            gameVersion = vj["inheritsFrom"].get<std::string>();
+        } else if (vj.contains("id") && vj["id"].is_string()) {
+            gameVersion = vj["id"].get<std::string>();
+        }
+
+        std::string base = Core::StringUtils::WideToUtf8(gameDir);
+        if (!base.empty() && base.back() != '\\') base += "\\";
+
+        return {
+            {"ok", true},
+            {"instanceName", profileName},
+            {"gameVersion", gameVersion},
+            {"loaders", DetectLoaders(profileName)},
+            {"gameDir", base},
+            {"paths", {
+                {"mod", base + "mods"},
+                {"resourcepack", base + "resourcepacks"},
+                {"shader", base + "shaderpacks"}
+            }}
+        };
+    }
+
+    // 这个 mod 文件和当前实例兼不兼容：游戏版本必须对得上；两边都认得加载器时还要对得上
+    // （实例是 Fabric 就装不了 Forge 的 mod）
+    static bool IsFileCompatibleWithInstance(const std::string& projectType,
+                                             const std::vector<std::string>& fileGameVersions,
+                                             const std::vector<std::string>& fileLoaders,
+                                             const std::string& instanceVersion,
+                                             const std::vector<std::string>& instanceLoaders) {
+        if (instanceVersion.empty() || fileGameVersions.empty()) return false;
+
+        bool versionMatch = false;
+        for (const auto& gv : fileGameVersions) {
+            if (gv == instanceVersion) { versionMatch = true; break; }
+        }
+        if (!versionMatch) return false;
+
+        if (projectType != "mod") return true;
+        if (instanceLoaders.empty()) return true;
+
+        bool hasRealLoader = false;
+        for (const auto& fl : fileLoaders) {
+            // minecraft 是每个文件都带的占位加载器，不算真实加载器
+            if (fl == "minecraft") continue;
+            hasRealLoader = true;
+            for (const auto& il : instanceLoaders) {
+                if (fl == il) return true;
+            }
+        }
+        // 文件没声明任何真实加载器（只有 minecraft 占位）时无法判断，按通过处理
+        return !hasRealLoader;
+    }
 
 private:
     tauricpp::App* g_app_ptr;
@@ -48,6 +125,31 @@ private:
             }).detach();
             return {{"ok", true}, {"async", true}};
         });
+
+        // config.getGameSettings - 读取游戏内存 / 窗口 / 版本隔离
+        bridge_.RegisterCommand("config.getGameSettings", [](const nlohmann::json&) -> nlohmann::json {
+            return HandleGetGameSettings();
+        });
+
+        // config.setGameSettings - 写入游戏内存 / 窗口 / 版本隔离
+        bridge_.RegisterCommand("config.setGameSettings", [](const nlohmann::json& args) -> nlohmann::json {
+            return HandleSetGameSettings(args);
+        });
+
+        // game.getResourcePaths - 当前版本的游戏目录与各类资源落点（另存为默认目录）
+        bridge_.RegisterCommand("game.getResourcePaths", [](const nlohmann::json&) -> nlohmann::json {
+            return GetResourcePaths();
+        });
+
+        // game.listMods - 某个版本 mods 文件夹里的所有 mod 与启用状态
+        bridge_.RegisterCommand("game.listMods", [](const nlohmann::json& args) -> nlohmann::json {
+            return HandleListMods(args);
+        });
+
+        // game.toggleMod - 启用/停用某个 mod（改扩展名）
+        bridge_.RegisterCommand("game.toggleMod", [](const nlohmann::json& args) -> nlohmann::json {
+            return HandleToggleMod(args);
+        });
     }
 
     // 发送启动进度事件
@@ -60,6 +162,53 @@ private:
                 g_app_ptr->GetBridge().Emit("game.launch.progress", event);
             } catch (...) {}
         }
+    }
+
+    // 启动过程中的提醒（前端收到后弹右上角消息）
+    void EmitLaunchNotice(const std::string& title, const std::string& content,
+                          const std::string& type) {
+        if (!g_app_ptr) return;
+        try {
+            g_app_ptr->GetBridge().Emit("game.launch.notice",
+                                        {{"title", title}, {"content", content}, {"type", type}});
+        } catch (...) {}
+    }
+
+    // 1.19 起客户端才启用聊天签名（enforce-secure-profile / 档案公钥都是那一版加的）。
+    // 只认 "1.x" 形式的正式版本号：快照（如 24w14a）解析不出来就当不需要提示，
+    // 宁可漏提示，也不要对老版本乱提示
+    static bool IsChatSigningVersion(const std::string& versionId) {
+        if (versionId.size() < 4 || versionId[0] != '1' || versionId[1] != '.') return false;
+
+        size_t i = 2;
+        if (i >= versionId.size() || !isdigit((unsigned char)versionId[i])) return false;
+        int minor = 0;
+        while (i < versionId.size() && isdigit((unsigned char)versionId[i])) {
+            minor = minor * 10 + (versionId[i] - '0');
+            i++;
+        }
+        return minor >= 19;
+    }
+
+    // 启动命令里带着访问令牌，写日志前先抹掉：
+    // 日志是明文文件，令牌留在里面等于把账号摊在磁盘上
+    static std::string RedactCommandSecrets(const std::string& cmd) {
+        const std::string key = "--accessToken";
+        std::string out = cmd;
+        size_t pos = 0;
+        while ((pos = out.find(key, pos)) != std::string::npos) {
+            size_t cursor = pos + key.size();
+            while (cursor < out.size() && out[cursor] == ' ') cursor++;
+            size_t end = out.find(' ', cursor);
+            if (end == std::string::npos) end = out.size();
+            if (end > cursor) {
+                out.replace(cursor, end - cursor, "***");
+                pos = cursor + 3;
+            } else {
+                pos = cursor;
+            }
+        }
+        return out;
     }
 
     // 运行 `java -version` 取主版本号（失败返回 0）
@@ -197,10 +346,15 @@ private:
     }
 
     // 判断 arguments 条目是否适用于当前平台。
-    // 比 MavenUtils::CheckRulesMatch 更完整：额外处理 os.arch 与 features。
+    // 比 MavenUtils::CheckRulesMatch 更完整：额外处理 os.version、os.arch 与 features。
     // 这一步很关键——原版 JSON 里有 os.name=osx 的 -XstartOnFirstThread，
     // 在 Windows 上带上它会让 JVM 直接拒绝启动。
-    static bool CheckArgRules(const nlohmann::json& entry) {
+    //
+    // features 按官方语义逐个键比对：启动器上报的值决定了哪些可选参数生效。
+    // 我们只支持 has_custom_resolution（有目标窗口尺寸时为真），
+    // is_demo_user 与 has_quick_plays_support / is_quick_play_* 一律为假
+    // ——试玩和 Quick Play 都不是启动器自动开启的功能。
+    static bool CheckArgRules(const nlohmann::json& entry, bool customResolution) {
         if (!entry.contains("rules") || !entry["rules"].is_array() || entry["rules"].empty()) {
             return true;
         }
@@ -233,9 +387,13 @@ private:
                 if (!ruleOs.empty() && ruleOs != currentOs) continue;
                 std::string ruleArch = rule["os"].value("arch", "");
                 if (!ruleArch.empty() && ruleArch != currentArch) continue;
+                // os.version 是正则（原版用它把 -Dos.name=Windows 10 限定在 Win10+）
+                std::string ruleVersion = rule["os"].value("version", "");
+                if (!ruleVersion.empty() && !OsVersionMatches(ruleVersion)) continue;
             }
-            // 依赖启动器特性（is_demo_user / has_custom_resolution 等）的规则一律不匹配
-            if (rule.contains("features") && rule["features"].is_object()) continue;
+            if (rule.contains("features") && rule["features"].is_object()) {
+                if (!FeaturesMatch(rule["features"], customResolution)) continue;
+            }
 
             if (action == "allow") {
                 allowed = true;
@@ -246,9 +404,639 @@ private:
         return allowed;
     }
 
+    // features 里的每个键都必须与启动器上报的值一致，规则才算命中；
+    // 不认识的键按"未启用"处理，避免把来路不明的可选参数加进去
+    static bool FeaturesMatch(const nlohmann::json& features, bool customResolution) {
+        for (auto it = features.begin(); it != features.end(); ++it) {
+            bool required = it.value().is_boolean() ? it.value().get<bool>() : true;
+            if (it.key() == "has_custom_resolution") {
+                if (required != customResolution) return false;
+            } else if (required) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool OsVersionMatches(const std::string& pattern) {
+        std::string version = RuntimeOsVersion();
+        try {
+            return std::regex_search(version, std::regex(pattern));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // 形如 "10.0.26100"；用于匹配 JSON 里的 os.version 规则
+    static std::string RuntimeOsVersion() {
+        static std::string cached = [] {
+            OSVERSIONINFOEXW info = { sizeof(OSVERSIONINFOEXW) };
+            typedef LONG(WINAPI * RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+            HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            if (ntdll) {
+                auto rtlGetVersion = (RtlGetVersionPtr)GetProcAddress(ntdll, "RtlGetVersion");
+                if (rtlGetVersion && rtlGetVersion((PRTL_OSVERSIONINFOW)&info) == 0) {
+                    return std::to_string(info.dwMajorVersion) + "." +
+                           std::to_string(info.dwMinorVersion) + "." +
+                           std::to_string(info.dwBuildNumber);
+                }
+            }
+            return std::string("0.0.0");
+        }();
+        return cached;
+    }
+
+    // ---- 启动设置（内存 / 窗口 / 版本隔离 / 游戏语言）----
+    struct GameSettings {
+        int maxMemoryMb;                // 0 = 按可用物理内存自动分配
+        std::string windowMode;         // default / fullscreen / custom
+        int windowWidth;
+        int windowHeight;
+        std::string versionIsolation;   // off / modded / all
+        std::string language;           // 写入 options.txt 的游戏语言，如 zh_cn
+    };
+
+    // 语言代码会被原样拼进 options.txt，只接受 Minecraft 用的 `<lang>_<region>` 小写形式；
+    // 空串 / 换行 / 路径之类的非法值一律退回 zh_cn，避免把 options.txt 写坏
+    static std::string SanitizeLanguage(const std::string& language) {
+        if (language.size() < 3 || language.size() > 16) return "zh_cn";
+        if (language.find('_') == std::string::npos) return "zh_cn";
+        for (char c : language) {
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') continue;
+            return "zh_cn";
+        }
+        return language;
+    }
+
+    // 读 config.json，坏文件一律当空对象，调用方不用再各自 try/catch
+    static nlohmann::json ReadConfig() {
+        try {
+            return nlohmann::json::parse(Core::ConfigManager::ReadConfigFile());
+        } catch (...) {
+            return nlohmann::json::object();
+        }
+    }
+
+    static GameSettings ReadGameSettings(const nlohmann::json& config) {
+        GameSettings settings{0, "default", 854, 480, "off", "zh_cn"};
+        if (!config.contains("game") || !config["game"].is_object()) return settings;
+
+        const nlohmann::json& game = config["game"];
+        settings.maxMemoryMb = game.value("maxMemoryMb", 0);
+        settings.windowMode = game.value("windowMode", std::string("default"));
+        settings.windowWidth = game.value("windowWidth", 854);
+        settings.windowHeight = game.value("windowHeight", 480);
+        settings.versionIsolation = game.value("versionIsolation", std::string("off"));
+        settings.language = game.value("language", std::string("zh_cn"));
+        settings.language = SanitizeLanguage(settings.language);
+
+        if (settings.maxMemoryMb < 0) settings.maxMemoryMb = 0;
+        if (settings.windowWidth < 100) settings.windowWidth = 854;
+        if (settings.windowHeight < 100) settings.windowHeight = 480;
+        if (settings.windowMode != "fullscreen" && settings.windowMode != "custom") {
+            settings.windowMode = "default";
+        }
+        if (settings.versionIsolation != "modded" && settings.versionIsolation != "all") {
+            settings.versionIsolation = "off";
+        }
+        return settings;
+    }
+
+    // 只有开了隔离，该版本的存档 / 配置 / 模组才落到自己的版本文件夹里；
+    // 关掉时所有版本共用 .minecraft（改动前的行为）
+    static bool ShouldIsolateVersion(const std::string& mode, bool isModdedVersion) {
+        if (mode == "all") return true;
+        if (mode == "modded") return isModdedVersion;
+        return false;
+    }
+
+    // 这个实例有没有真正玩过：saves 目录里有存档才算。
+    // 游戏只要启动过一次就会建出空的 saves，所以空目录和不存在一样按“没玩过”处理。
+    static bool HasSaveContent(const std::wstring& gameDir) {
+        std::wstring savesDir = gameDir + L"\\saves";
+        DWORD attr = GetFileAttributesW(savesDir.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return false;
+
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((savesDir + L"\\*").c_str(), &findData);
+        if (hFind == INVALID_HANDLE_VALUE) return false;
+
+        bool hasContent = false;
+        do {
+            std::wstring name = findData.cFileName;
+            if (name != L"." && name != L"..") {
+                hasContent = true;
+                break;
+            }
+        } while (FindNextFileW(hFind, &findData));
+        FindClose(hFind);
+        return hasContent;
+    }
+
+    // 首次启动的无障碍引导界面（"Welcome to Minecraft" 旁白欢迎页）只认 options.txt 里的
+    // lang / onboardAccessibility 两个键，启动参数改不了它：lang 缺失时默认 en_us，
+    // onboardAccessibility 缺失时默认 true（= 弹出引导页）。
+    //
+    // “首次启动”判定沿用 PCL（#3844）的思路，并放宽到两条件任一成立即可：
+    //   · options.txt 里没有 lang 行；或
+    //   · 这个实例还没产生过存档（整合包往往自带了 options.txt，那不是玩家选的语言）
+    // 判定成立时按启动器设置写入 lang 并补上 onboardAccessibility:false；不成立说明玩家
+    // 已经在游戏里自己选过语言，整份文件一个字都不动。
+    // 改写时逐行原地替换，其它键与原顺序保持不变，也不新增 version 行（那是游戏自己的
+    // 数据版本号，写错会让它走错迁移分支）。
+    static void EnsureGameOptionsFile(const std::string& gameDirUtf8, const std::string& language) {
+        std::wstring gameDir = Core::StringUtils::Utf8ToWide(gameDirUtf8);
+        std::wstring path = gameDir + L"\\options.txt";
+
+        std::string existing;
+        if (Core::FileManager::FileExists(path)) {
+            std::ifstream in(path, std::ios::binary);
+            if (!in.is_open()) return;
+            std::stringstream buffer;
+            buffer << in.rdbuf();
+            in.close();
+            existing = buffer.str();
+        }
+
+        // 按 \n 切行，\r 留在行尾，回写时才能原样保住 CRLF
+        std::vector<std::string> lines;
+        {
+            std::stringstream in(existing);
+            std::string line;
+            while (std::getline(in, line)) lines.push_back(line);
+        }
+
+        auto findKey = [&lines](const std::string& key) -> size_t {
+            for (size_t i = 0; i < lines.size(); i++) {
+                std::string line = lines[i];
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                // 必须是 "key:" 整键匹配，避免把 langXXX 当成 lang
+                if (line.size() > key.size() && line.compare(0, key.size(), key) == 0 &&
+                    line[key.size()] == ':') {
+                    return i;
+                }
+            }
+            return lines.size();
+        };
+
+        const bool firstLaunch = findKey("lang") == lines.size() || !HasSaveContent(gameDir);
+        if (!firstLaunch) return;
+
+        auto upsert = [&lines, &findKey](const std::string& key, const std::string& value) {
+            size_t index = findKey(key);
+            if (index == lines.size()) {
+                lines.push_back(key + ":" + value);
+                return;
+            }
+            std::string eol = (!lines[index].empty() && lines[index].back() == '\r') ? "\r" : "";
+            lines[index] = key + ":" + value + eol;
+        };
+
+        upsert("lang", language);
+        upsert("onboardAccessibility", "false");
+
+        std::string content;
+        for (const std::string& line : lines) content += line + "\n";
+
+        if (Core::FileManager::SaveFile(path, content)) {
+            WriteLaunchLog("已写入 options.txt: lang=" + language + ", onboardAccessibility=false (跳过无障碍引导界面)");
+        } else {
+            WriteLaunchLog("警告: options.txt 写入失败: " + Core::StringUtils::WideToUtf8(path));
+        }
+    }
+
+    static int CountModFiles(const std::wstring& gameDir) {
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((gameDir + L"\\mods\\*").c_str(), &findData);
+        if (hFind == INVALID_HANDLE_VALUE) return 0;
+
+        int count = 0;
+        do {
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+            std::wstring name = findData.cFileName;
+            for (wchar_t& c : name) {
+                if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            }
+            if (name.size() >= 4 && (name.compare(name.size() - 4, 4, L".jar") == 0 ||
+                                     name.compare(name.size() - 4, 4, L".zip") == 0)) {
+                count++;
+            } else if (name.size() >= 8 && name.compare(name.size() - 8, 8, L".litemod") == 0) {
+                count++;
+            }
+        } while (FindNextFileW(hFind, &findData));
+        FindClose(hFind);
+        return count;
+    }
+
+    // 自动内存：沿用 PCL 的分阶段分配 —— 先无条件满足"勉强能跑"的档位，
+    // 剩下的可用内存再按 70% / 40% / 15% 的递减比例投入更高的档位，
+    // 这样内存越多给得越多，但永远不会把可用内存吃干。
+    static int ComputeAutoMemoryMb(bool isModdedVersion, const std::wstring& gameDir) {
+        MEMORYSTATUSEX status = { sizeof(MEMORYSTATUSEX) };
+        if (!GlobalMemoryStatusEx(&status)) return 2048;
+
+        double available = status.ullAvailPhys / 1024.0 / 1024.0 / 1024.0;
+
+        double minimum, target1, target2, target3;
+        if (isModdedVersion) {
+            double mods = CountModFiles(gameDir);
+            minimum = 0.5 + mods / 150.0;
+            target1 = 1.5 + mods / 90.0;
+            target2 = 2.7 + mods / 50.0;
+            target3 = 4.5 + mods / 25.0;
+        } else {
+            minimum = 0.5;
+            target1 = 1.5;
+            target2 = 2.5;
+            target3 = 4.0;
+        }
+
+        double give = 0;
+        double delta = target1;
+        give += (std::min)(available, delta);
+        available -= delta;
+
+        if (available >= 0.1) {
+            delta = target2 - target1;
+            give += (std::min)(available * 0.7, delta);
+            available -= delta / 0.7;
+        }
+        if (available >= 0.1) {
+            delta = target3 - target2;
+            give += (std::min)(available * 0.4, delta);
+            available -= delta / 0.4;
+        }
+        if (available >= 0.1) {
+            give += (std::min)(available * 0.15, target3);
+        }
+
+        give = std::round((std::max)(give, minimum) * 10) / 10;
+        int mb = (int)std::llround(give * 1024);
+        return mb < 512 ? 512 : mb;
+    }
+
+    static int TotalPhysicalMemoryMb() {
+        MEMORYSTATUSEX status = { sizeof(MEMORYSTATUSEX) };
+        if (!GlobalMemoryStatusEx(&status)) return 0;
+        return (int)(status.ullTotalPhys / 1024 / 1024);
+    }
+
+    // 版本 JSON 里的文件路径（版本隔离与加载器识别都要读它）
+    static std::wstring GetVersionJsonPath(const std::string& profileName) {
+        std::wstring wide = Core::StringUtils::Utf8ToWide(profileName);
+        return Core::FileManager::GetExeDir() + L"\\.minecraft\\versions\\" + wide + L"\\" + wide + L".json";
+    }
+
+    static nlohmann::json ReadVersionJson(const std::string& profileName) {
+        if (profileName.empty()) return nlohmann::json::object();
+        std::ifstream versionFile(GetVersionJsonPath(profileName));
+        if (!versionFile.is_open()) return nlohmann::json::object();
+        std::stringstream ss;
+        ss << versionFile.rdbuf();
+        try {
+            return nlohmann::json::parse(ss.str());
+        } catch (...) {
+            return nlohmann::json::object();
+        }
+    }
+
+    // 带 inheritsFrom 的版本 JSON 就是模组加载器版本（Forge / Fabric / Quilt / NeoForge）
+    static bool IsModdedProfile(const std::string& profileName) {
+        nlohmann::json vj = ReadVersionJson(profileName);
+        return vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string();
+    }
+
+    // 整合包实例强制版本隔离的标记键。
+    // 全局的 game.versionIsolation 是给用户自己调的开关，整合包不能依赖它：
+    // 一个整合包实例必须独占自己的 mods / saves / 配置，否则装完就会被别的
+    // 版本污染（反过来它也会污染别人）。所以由安装方在版本 JSON 里打上这个键，
+    // 隔离判定时与全局开关取"或"。
+    // 版本 JSON 是启动器侧的元数据，游戏只读自己 jar 里的那份，多一个键它看不见。
+    static constexpr const char* kForceIsolationKey = "__tauricppForceIsolation";
+
+    static bool IsForceIsolated(const nlohmann::json& versionJson) {
+        return versionJson.contains(kForceIsolationKey) &&
+               versionJson[kForceIsolationKey].is_boolean() &&
+               versionJson[kForceIsolationKey].get<bool>();
+    }
+
+    // 从版本 JSON 的 libraries 里认出加载器，用于判断 mod 和这个实例兼不兼容。
+    // 加载器版本自己只声明增量，真正的 loader 库就在它自己的 JSON 里
+    static nlohmann::json DetectLoaders(const std::string& profileName) {
+        nlohmann::json result = nlohmann::json::array();
+        nlohmann::json vj = ReadVersionJson(profileName);
+        if (!vj.contains("libraries") || !vj["libraries"].is_array()) return result;
+
+        struct { const char* prefix; const char* name; } known[] = {
+            {"net.fabricmc:fabric-loader", "fabric"},
+            {"net.minecraftforge:forge", "forge"},
+            {"net.neoforged:neoforge", "neoforge"},
+            {"org.quiltmc:quilt-loader", "quilt"},
+        };
+        for (const auto& lib : vj["libraries"]) {
+            std::string name = lib.value("name", "");
+            for (const auto& k : known) {
+                if (name.rfind(k.prefix, 0) == 0) {
+                    bool exists = false;
+                    for (const auto& added : result) {
+                        if (added == k.name) { exists = true; break; }
+                    }
+                    if (!exists) result.push_back(k.name);
+                }
+            }
+        }
+        return result;
+    }
+
+    // 任意版本应用版本隔离后的游戏目录（不含结尾反斜杠）
+    static std::wstring ResolveGameDirForVersion(const std::string& profileName, const GameSettings& settings) {
+        std::wstring minecraftDir = Core::FileManager::GetExeDir() + L"\\.minecraft";
+        if (profileName.empty()) return minecraftDir;
+
+        std::wstring versionDir = minecraftDir + L"\\versions\\" + Core::StringUtils::Utf8ToWide(profileName);
+        nlohmann::json vj = ReadVersionJson(profileName);
+        const bool modded = vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string();
+        return (ShouldIsolateVersion(settings.versionIsolation, modded) || IsForceIsolated(vj))
+                   ? versionDir : minecraftDir;
+    }
+
+    // 当前选中版本是不是模组版本、它的游戏目录在哪 —— 自动内存和隔离都要按这个算
+    static void ResolveSelectedVersion(const nlohmann::json& config, const GameSettings& settings,
+                                       std::string& profileName, bool& isModded, std::wstring& gameDir) {
+        profileName = "";
+        if (config.contains("game") && config["game"].is_object()) {
+            profileName = config["game"].value("selectedVersion", "");
+        }
+
+        isModded = IsModdedProfile(profileName);
+        gameDir = ResolveGameDirForVersion(profileName, settings);
+    }
+
+    // 列出某个版本 mods 文件夹里的所有 mod 与启用状态。
+    // 停用的 mod 是把扩展名换成 .disabled（加载器只认 .jar，改掉就不会被读）
+    static nlohmann::json HandleListMods(const nlohmann::json& args) {
+        std::string profileName = args.value("version", "");
+        if (profileName.empty()) return {{"ok", false}, {"error", "Missing version"}};
+
+        GameSettings settings = ReadGameSettings(ReadConfig());
+        std::wstring gameDir = ResolveGameDirForVersion(profileName, settings);
+        std::wstring modsDir = gameDir + L"\\mods";
+
+        nlohmann::json mods = nlohmann::json::array();
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((modsDir + L"\\*").c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::string name = Core::StringUtils::WideToUtf8(findData.cFileName);
+
+                std::string lower = name;
+                for (auto& c : lower) c = (char)tolower(c);
+                // 先把停用后缀剥掉再判扩展名，"xxx.jar.disabled" 也算 mod 文件
+                bool disabled = lower.size() >= 9 &&
+                    lower.compare(lower.size() - 9, 9, ".disabled") == 0;
+                std::string base = disabled ? lower.substr(0, lower.size() - 9) : lower;
+
+                auto endsWith = [](const std::string& s, const std::string& suffix) {
+                    return s.size() > suffix.size() &&
+                           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+                };
+                if (!endsWith(base, ".jar") && !endsWith(base, ".zip") && !endsWith(base, ".litemod")) {
+                    continue;
+                }
+
+                long long size = ((long long)findData.nFileSizeHigh << 32) | findData.nFileSizeLow;
+                std::string enabledName = disabled ? name.substr(0, name.size() - 9) : name;
+                mods.push_back({
+                    {"name", name},
+                    {"enabledName", enabledName},
+                    {"enabled", !disabled},
+                    {"size", size}
+                });
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+        }
+
+        return {
+            {"ok", true},
+            {"mods", mods},
+            {"modsDir", Core::StringUtils::WideToUtf8(modsDir)},
+            // 没开隔离时多个版本共用同一个 .minecraft\mods，界面要能说清楚这一点
+            {"shared", gameDir == (Core::FileManager::GetExeDir() + L"\\.minecraft")}
+        };
+    }
+
+    // 切换启用状态：启用 → 去掉 .disabled，停用 → 加上 .disabled
+    static nlohmann::json HandleToggleMod(const nlohmann::json& args) {
+        std::string profileName = args.value("version", "");
+        std::string name = args.value("name", "");
+        bool enable = args.value("enable", true);
+        if (profileName.empty() || name.empty()) return {{"ok", false}, {"error", "Missing version or name"}};
+
+        GameSettings settings = ReadGameSettings(ReadConfig());
+        std::wstring modsDir = ResolveGameDirForVersion(profileName, settings) + L"\\mods";
+        std::wstring from = modsDir + L"\\" + Core::StringUtils::Utf8ToWide(name);
+
+        const std::wstring suffix = L".disabled";
+        bool currentlyDisabled = from.size() > suffix.size() &&
+            from.compare(from.size() - suffix.size(), suffix.size(), suffix) == 0;
+
+        std::wstring to;
+        if (enable) {
+            if (!currentlyDisabled) return {{"ok", true}, {"name", name}, {"enabled", true}};  // 已经是启用态
+            to = from.substr(0, from.size() - suffix.size());
+        } else {
+            if (currentlyDisabled) return {{"ok", true}, {"name", name}, {"enabled", false}};
+            to = from + suffix;
+        }
+
+        if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return {{"ok", false}, {"error", "Mod 文件不存在，可能已被移动或删除"}};
+        }
+        // 目标已存在就先删掉，否则 MoveFileW 会失败（例如 .disabled 和 .jar 同时存在）
+        if (GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileW(to.c_str());
+        }
+        if (!MoveFileW(from.c_str(), to.c_str())) {
+            return {{"ok", false}, {"error", "文件被占用，改名失败"}};
+        }
+
+        std::string newName = Core::StringUtils::WideToUtf8(to.substr(to.find_last_of(L'\\') + 1));
+        return {{"ok", true}, {"name", newName}, {"enabled", enable}};
+    }
+
+    // 前端 bridge: 读取游戏设置（内存 / 窗口 / 版本隔离），附带算好的自动内存供界面显示
+    static nlohmann::json HandleGetGameSettings() {
+        nlohmann::json config;
+        try {
+            config = nlohmann::json::parse(Core::ConfigManager::ReadConfigFile());
+        } catch (...) {
+            config = nlohmann::json::object();
+        }
+
+        GameSettings settings = ReadGameSettings(config);
+        std::string profileName;
+        bool isModded = false;
+        std::wstring gameDir;
+        ResolveSelectedVersion(config, settings, profileName, isModded, gameDir);
+
+        return {
+            {"ok", true},
+            {"maxMemoryMb", settings.maxMemoryMb},
+            {"autoMemoryMb", ComputeAutoMemoryMb(isModded, gameDir)},
+            {"totalMemoryMb", TotalPhysicalMemoryMb()},
+            {"windowMode", settings.windowMode},
+            {"windowWidth", settings.windowWidth},
+            {"windowHeight", settings.windowHeight},
+            {"versionIsolation", settings.versionIsolation},
+            {"language", settings.language},
+            {"selectedVersion", profileName},
+            {"moddedVersion", isModded}
+        };
+    }
+
+    static nlohmann::json HandleSetGameSettings(const nlohmann::json& args) {
+        nlohmann::json config;
+        try {
+            config = nlohmann::json::parse(Core::ConfigManager::ReadConfigFile());
+        } catch (...) {
+            config = nlohmann::json::object();
+        }
+        if (!config.contains("game") || !config["game"].is_object()) {
+            config["game"] = nlohmann::json::object();
+        }
+
+        // 先读回当前值再逐项覆盖：这样越界输入会被 ReadGameSettings 夹回合法范围
+        GameSettings settings = ReadGameSettings(config);
+        if (args.contains("maxMemoryMb")) settings.maxMemoryMb = args["maxMemoryMb"].get<int>();
+        if (args.contains("windowMode")) settings.windowMode = args["windowMode"].get<std::string>();
+        if (args.contains("windowWidth")) settings.windowWidth = args["windowWidth"].get<int>();
+        if (args.contains("windowHeight")) settings.windowHeight = args["windowHeight"].get<int>();
+        if (args.contains("versionIsolation")) settings.versionIsolation = args["versionIsolation"].get<std::string>();
+        if (args.contains("language")) settings.language = SanitizeLanguage(args["language"].get<std::string>());
+
+        if (settings.maxMemoryMb != 0) {
+            if (settings.maxMemoryMb < 512) settings.maxMemoryMb = 512;
+            int total = TotalPhysicalMemoryMb();
+            if (total > 0 && settings.maxMemoryMb > total) settings.maxMemoryMb = total - 512;
+            if (settings.maxMemoryMb < 512) settings.maxMemoryMb = 512;
+        }
+
+        config["game"]["maxMemoryMb"] = settings.maxMemoryMb;
+        config["game"]["windowMode"] = settings.windowMode;
+        config["game"]["windowWidth"] = settings.windowWidth;
+        config["game"]["windowHeight"] = settings.windowHeight;
+        config["game"]["versionIsolation"] = settings.versionIsolation;
+        config["game"]["language"] = settings.language;
+
+        bool ok = Core::ConfigManager::WriteConfigFile(config.dump(4));
+        return {{"ok", ok}};
+    }
+
+    // 版本 JSON 里 ${...} 占位符的取值
+    struct ArgValues {
+        std::string username;
+        std::string uuid;
+        std::string accessToken;   // 正版是 Minecraft 访问令牌，离线是 "0"
+        std::string userType;      // msa（正版）/ mojang（离线）
+        std::string xuid;          // 只有正版账号有
+        std::string gameDir;
+        std::string assetsDir;
+        std::string assetIndex;
+        std::string versionName;
+        std::string versionType;
+        std::string resolutionWidth;
+        std::string resolutionHeight;
+        std::string primaryJar;
+        std::string gameAssetsDir;
+        std::string librariesDir;
+    };
+
+    // 把 arguments.game / minecraftArguments 里的占位符替换成实际值。
+    // 替换完值为空的参数（离线账号的 clientId / xuid）连同它的 flag 一起丢掉：
+    // 空值会被 JVM 当成"下一个参数"吃掉，宁可少传一个可选参数，也不能让后面的参数整体错位。
+    static void SubstituteGameArgs(std::vector<std::string>& args, const ArgValues& values) {
+        auto replaceAll = [](std::string& str, const std::string& from, const std::string& to) {
+            if (from.empty()) return;
+            size_t pos = 0;
+            while ((pos = str.find(from, pos)) != std::string::npos) {
+                str.replace(pos, from.length(), to);
+                pos += to.length();
+            }
+        };
+
+        for (std::string& arg : args) {
+            replaceAll(arg, "${auth_player_name}", values.username);
+            replaceAll(arg, "${auth_uuid}", values.uuid);
+            replaceAll(arg, "${auth_access_token}", values.accessToken);
+            replaceAll(arg, "${auth_session}", values.accessToken);
+            replaceAll(arg, "${game_directory}", values.gameDir);
+            replaceAll(arg, "${assets_root}", values.assetsDir);
+            replaceAll(arg, "${assets_index_name}", values.assetIndex);
+            replaceAll(arg, "${version_name}", values.versionName);
+            replaceAll(arg, "${user_properties}", "{}");
+            replaceAll(arg, "${user_type}", values.userType);
+            replaceAll(arg, "${version_type}", values.versionType);
+            replaceAll(arg, "${resolution_width}", values.resolutionWidth);
+            replaceAll(arg, "${resolution_height}", values.resolutionHeight);
+            replaceAll(arg, "${primary_jar}", values.primaryJar);
+            replaceAll(arg, "${game_assets}", values.gameAssetsDir);
+            replaceAll(arg, "${library_directory}", values.librariesDir);
+            replaceAll(arg, "${libraries_directory}", values.librariesDir);
+            replaceAll(arg, "${clientid}", "");
+            replaceAll(arg, "${auth_xuid}", values.xuid);
+            replaceAll(arg, "${launcher_name}", "TauriCPP");
+            replaceAll(arg, "${launcher_version}", "1.0");
+
+            // 剩下没人认领的占位符整段抹掉
+            size_t pos = 0;
+            while ((pos = arg.find("${", pos)) != std::string::npos) {
+                size_t end = arg.find("}", pos);
+                if (end == std::string::npos) break;
+                arg.erase(pos, end - pos + 1);
+            }
+
+            // 替换后可能只剩空白（取值被整个抹掉），trim 掉免得被当成带空格的参数
+            while (!arg.empty() && (arg.front() == ' ' || arg.front() == '\t')) arg.erase(0, 1);
+            while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t')) arg.pop_back();
+        }
+
+        std::vector<std::string> cleaned;
+        for (size_t i = 0; i < args.size(); i++) {
+            if (args[i].empty()) continue;
+            if (i + 1 < args.size() && args[i + 1].empty() && args[i][0] == '-') {
+                i++;
+                continue;
+            }
+            cleaned.push_back(args[i]);
+        }
+        args = cleaned;
+    }
+
+    // argfile 里带着 --accessToken，正版账号放的是真实令牌，
+    // JVM 读完参数就不需要它了。先覆写再删除，别让它一直躺在磁盘上——
+    // 令牌只加密存在 config.json 里，这里又被明文写回去就前功尽弃了。
+    static void RemoveLaunchArgfile(const std::wstring& argfilePath) {
+        if (argfilePath.empty()) return;
+
+        HANDLE hFile = CreateFileW(argfilePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size{};
+            if (GetFileSizeEx(hFile, &size) && size.QuadPart > 0) {
+                std::vector<char> filler((size_t)size.QuadPart, ' ');
+                DWORD written = 0;
+                WriteFile(hFile, filler.data(), (DWORD)filler.size(), &written, nullptr);
+                FlushFileBuffers(hFile);
+            }
+            CloseHandle(hFile);
+        }
+        DeleteFileW(argfilePath.c_str());
+    }
+
     // 日志写入
-    static void WriteLaunchLog(const std::string& message) {
-        std::wstring logDir = Core::FileManager::GetExeDir() + L"\\.minecraft\\logs";
+    static void WriteLaunchLog(const std::string& message) {        std::wstring logDir = Core::FileManager::GetExeDir() + L"\\.minecraft\\logs";
         CreateDirectoryW(logDir.c_str(), nullptr);
 
         SYSTEMTIME st;
@@ -321,22 +1109,41 @@ private:
         // 错加参数却会让 JVM 完全无法启动。探测失败时同样按不支持处理。
         const bool supportsNativeAccess = javaMajor >= 17;
 
-        // 获取账号信息
-        std::string username = "";
-        if (config.contains("accounts") && config["accounts"].is_array()) {
-            for (const auto& acc : config["accounts"]) {
-                if (acc.is_string() && !acc.get<std::string>().empty()) {
-                    username = acc.get<std::string>();
-                    break;
-                }
-            }
-        }
-        if (username.empty()) {
+        // 获取账号信息。
+        // 正版账号必须带上真实的 UUID 与访问令牌，且令牌过期时先刷新——
+        // 拿离线 UUID 或 "0" 令牌进服会被服务端判定为无效会话。
+        const int accountIndex = Core::ConfigManager::ResolveActiveAccountIndex(config);
+        if (accountIndex < 0) {
+            WriteLaunchLog("错误: 没有已登录的账号");
             return {{"ok", false}, {"error", "No account logged in"}};
         }
 
-        std::string uuid = Core::HashUtils::GenerateOfflineUUID(username);
-        WriteLaunchLog("用户名: " + username + ", UUID: " + uuid);
+        // 会话处理按账号类型分流：正版刷微软令牌，外置登录校验/刷新 Yggdrasil 令牌
+        const Core::ConfigManager::AccountSlot activeSlot =
+            Core::ConfigManager::ReadAccountSlot(config, accountIndex);
+        const bool isYggdrasilAccount = activeSlot.type == "yggdrasil";
+
+        nlohmann::json account = isYggdrasilAccount
+            ? Services::YggdrasilAuthService::EnsureFreshSession(accountIndex)
+            : Services::MsaAuthService::EnsureFreshSession(accountIndex);
+        if (!account.value("ok", false)) {
+            std::string reason = account.value("error", std::string("账号不可用"));
+            WriteLaunchLog("错误: 账号不可用: " + reason);
+            return {{"ok", false}, {"error", reason}};
+        }
+
+        const std::string username = account.value("name", std::string());
+        const std::string uuid = account.value("uuid", std::string());
+        const std::string accessToken = account.value("accessToken", std::string());
+        const std::string xuid = account.value("xuid", std::string());
+        const bool isMsaAccount = account.value("type", std::string("offline")) == "msa";
+        // 外置登录由注入的 authlib-injector 代理认证，game 参数里的 userType 仍是 mojang，
+        // 但 UUID 和令牌必须是第三方服务器给出的真实值
+        const std::string yggdrasilApiRoot = account.value("apiRoot", std::string());
+        // 离线账号沿用原来的 "mojang" + "0" 令牌，正版和外置登录才换成真实值
+        const std::string userType = isMsaAccount ? "msa" : "mojang";
+        WriteLaunchLog("账号: " + username + ", UUID: " + uuid + ", 登录方式: " +
+                       (isMsaAccount ? "正版" : (isYggdrasilAccount ? "外置登录" : "离线")));
 
         // 读取版本 JSON
         std::wstring minecraftDir = Core::FileManager::GetExeDir() + L"\\.minecraft";
@@ -364,6 +1171,9 @@ private:
         }
         std::stringstream vjSS;
         vjSS << vjFile.rdbuf();
+        // 读完立刻关掉：ifstream 默认不带 FILE_SHARE_DELETE，句柄留到启动结束会让
+        // 版本目录在整个启动期间（尤其长时间校验/下载时）一直删不掉
+        vjFile.close();
         nlohmann::json vj;
         try {
             vj = nlohmann::json::parse(vjSS.str());
@@ -390,27 +1200,54 @@ private:
             WriteLaunchLog("检测到 LWJGL 2.x 版本: " + gameVersionId);
         }
 
+        // 外置登录 + 1.19 及以上：客户端会做聊天签名，用的是账号的档案公钥。
+        // 第三方验证服务器多半没有实现 feature.enable_profile_key，账号拿不到公钥，
+        // 于是进了 enforce-secure-profile=true 的服务器就发不出消息。这里提前讲清楚，
+        // 免得用户以为是启动器坏了
+        if (isYggdrasilAccount && IsChatSigningVersion(gameVersionId)) {
+            EmitLaunchNotice(
+                "聊天签名提示",
+                "当前版本（" + gameVersionId + "）开启聊天签名，而外置登录的验证服务器可能未实现 "
+                "feature.enable_profile_key。在开启 enforce-secure-profile 的服务器里可能无法发送"
+                "聊天消息。建议请服务器管理员关闭 enforce-secure-profile，或先确认该验证服务器已"
+                "支持聊天签名。",
+                "warning");
+        }
+
         // 处理 inheritsFrom: 从原版 JSON 读取 assetIndex 等信息
-        // 原版 JSON 存储在 versions/<profileName>/<inheritsFrom>.json
+        // 标准布局是 versions/<inheritsFrom>/<inheritsFrom>.json（PCL / HMCL / 官启
+        // 都按这个找前置版本）；早期版本我们把原版 JSON 塞在实例目录里，
+        // 下面第二个路径就是给那种老实例留的兼容回退
         nlohmann::json parentVj;
         if (vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string()) {
             std::string parentId = vj["inheritsFrom"].get<std::string>();
             WriteLaunchLog("版本继承自: " + parentId);
-            std::wstring parentJsonPath = versionDir + L"\\" +
-                Core::StringUtils::Utf8ToWide(parentId) + L".json";
-            std::ifstream parentFile(parentJsonPath);
-            if (parentFile.is_open()) {
+
+            std::vector<std::wstring> candidates = {
+                minecraftDir + L"\\versions\\" + Core::StringUtils::Utf8ToWide(parentId) + L"\\" +
+                    Core::StringUtils::Utf8ToWide(parentId) + L".json",
+                versionDir + L"\\" + Core::StringUtils::Utf8ToWide(parentId) + L".json",
+            };
+
+            std::wstring parentJsonPath;
+            for (const auto& candidate : candidates) {
+                std::ifstream parentFile(candidate);
+                if (!parentFile.is_open()) continue;
                 std::stringstream parentSS;
                 parentSS << parentFile.rdbuf();
                 parentFile.close();
                 try {
                     parentVj = nlohmann::json::parse(parentSS.str());
-                    WriteLaunchLog("原版 JSON 加载成功: " + Core::StringUtils::WideToUtf8(parentJsonPath));
+                    parentJsonPath = candidate;
+                    WriteLaunchLog("原版 JSON 加载成功: " + Core::StringUtils::WideToUtf8(candidate));
+                    break;
                 } catch (...) {
-                    WriteLaunchLog("警告: 原版 JSON 解析失败: " + parentId);
+                    WriteLaunchLog("警告: 原版 JSON 解析失败: " + Core::StringUtils::WideToUtf8(candidate));
                 }
-            } else {
-                WriteLaunchLog("警告: 原版 JSON 未找到: " + Core::StringUtils::WideToUtf8(parentJsonPath));
+            }
+            if (parentJsonPath.empty()) {
+                WriteLaunchLog("警告: 找不到前置版本 " + parentId +
+                               "（应当在 versions\\" + parentId + "\\ 里）");
             }
         }
 
@@ -453,9 +1290,13 @@ private:
 
         WriteLaunchLog("合并后依赖: " + std::to_string(mergedLibs.size()) + " 个");
 
-        // ==================== 文件完整性检查与自动下载 ====================
+        // ==================== 启动前文件完整性校验 ====================
+        // 这里只“校验”不“补下载”：没下完的版本应当回下载页补齐，启动路径上隐式拉取
+        // 会把启动长时间卡在静默下载里（还一直占着版本 JSON，版本目录都删不掉）。
+        // 唯一就地重下的是「文件在、但 SHA-1 对不上」的单文件损坏，代价小、不影响定位。
         std::wstring libsBase = minecraftDir + L"\\libraries";
         std::vector<std::string> missingFiles;
+        int missingTotal = 0;
 
         WriteLaunchLog("--- 开始文件完整性检查 ---");
         WriteLaunchLog("版本 JSON 路径: " + Core::StringUtils::WideToUtf8(versionJsonPath));
@@ -563,27 +1404,8 @@ private:
                 if (attr == INVALID_FILE_ATTRIBUTES) {
                     WriteLaunchLog("缺失: " + name);
                     WriteLaunchLog("  路径: " + Core::StringUtils::WideToUtf8(jarPath));
-                    WriteLaunchLog("  URL: " + downloadUrl);
-                    if (!downloadUrl.empty()) {
-                        Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(downloadUrl));
-                        if (res.status == 200 && !res.body.empty()) {
-                            if (!sha1.empty()) {
-                                std::string actualSha1 = Core::HashUtils::ComputeSHA1(res.body);
-                                if (actualSha1 != sha1) {
-                                    WriteLaunchLog("  SHA-1 校验失败!");
-                                    missingFiles.push_back(name);
-                                    continue;
-                                }
-                            }
-                            std::wstring parentDir = jarPath.substr(0, jarPath.find_last_of(L'\\'));
-                            SHCreateDirectoryExW(NULL, parentDir.c_str(), NULL);
-                            Core::FileManager::SaveFile(jarPath, res.body);
-                            WriteLaunchLog("  下载完成");
-                        } else {
-                            WriteLaunchLog("  下载失败, 状态码: " + std::to_string(res.status));
-                            missingFiles.push_back(name);
-                        }
-                    }
+                    missingTotal++;
+                    missingFiles.push_back(name);
                 } else if (!sha1.empty()) {
                     std::string existingHash = Core::HashUtils::ComputeFileSHA1(jarPath);
                     if (existingHash != sha1) {
@@ -597,6 +1419,7 @@ private:
                                 Core::FileManager::SaveFile(jarPath, res.body);
                                 WriteLaunchLog("  重新下载完成");
                             } else {
+                                missingTotal++;
                                 missingFiles.push_back(name);
                             }
                         }
@@ -643,26 +1466,8 @@ private:
                             DWORD nativeAttr = GetFileAttributesW(nativeJarPath.c_str());
                             if (nativeAttr == INVALID_FILE_ATTRIBUTES) {
                                 WriteLaunchLog("缺失 Natives JAR: " + nativePath);
-                                if (!nativeUrl.empty()) {
-                                    Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(nativeUrl));
-                                    if (res.status == 200 && !res.body.empty()) {
-                                        if (!nativeSha1.empty()) {
-                                            std::string actualSha1 = Core::HashUtils::ComputeSHA1(res.body);
-                                            if (actualSha1 != nativeSha1) {
-                                                WriteLaunchLog("  Natives JAR SHA-1 校验失败!");
-                                                missingFiles.push_back(name + " (natives)");
-                                                continue;
-                                            }
-                                        }
-                                        std::wstring parentDir = nativeJarPath.substr(0, nativeJarPath.find_last_of(L'\\'));
-                                        SHCreateDirectoryExW(NULL, parentDir.c_str(), NULL);
-                                        Core::FileManager::SaveFile(nativeJarPath, res.body);
-                                        WriteLaunchLog("  Natives JAR 下载完成");
-                                    } else {
-                                        WriteLaunchLog("  Natives JAR 下载失败, 状态码: " + std::to_string(res.status));
-                                        missingFiles.push_back(name + " (natives)");
-                                    }
-                                }
+                                missingTotal++;
+                                missingFiles.push_back(name + " (natives)");
                             } else if (!nativeSha1.empty()) {
                                 std::string existingHash = Core::HashUtils::ComputeFileSHA1(nativeJarPath);
                                 if (existingHash != nativeSha1) {
@@ -674,6 +1479,7 @@ private:
                                             Core::FileManager::SaveFile(nativeJarPath, res.body);
                                             WriteLaunchLog("  Natives JAR 重新下载完成");
                                         } else {
+                                            missingTotal++;
                                             missingFiles.push_back(name + " (natives)");
                                         }
                                     }
@@ -699,21 +1505,8 @@ private:
 
             DWORD jarAttr = GetFileAttributesW(versionJar.c_str());
             if (jarAttr == INVALID_FILE_ATTRIBUTES) {
+                // 缺失统一交给下面那段记一次，这里只处理「存在但校验失败」的损坏重下
                 WriteLaunchLog("缺失版本 JAR: " + profileName);
-                if (!clientUrl.empty()) {
-                    Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(clientUrl));
-                    if (res.status == 200 && !res.body.empty()) {
-                        if (!clientSha1.empty()) {
-                            std::string actualSha1 = Core::HashUtils::ComputeSHA1(res.body);
-                            if (actualSha1 != clientSha1) {
-                                WriteLaunchLog("  SHA-1 校验失败!");
-                                missingFiles.push_back(Core::StringUtils::WideToUtf8(versionJar));
-                            }
-                        }
-                        Core::FileManager::SaveFile(versionJar, res.body);
-                        WriteLaunchLog("  下载完成");
-                    }
-                }
             } else if (!clientSha1.empty()) {
                 std::string existingHash = Core::HashUtils::ComputeFileSHA1(versionJar);
                 if (existingHash != clientSha1) {
@@ -734,6 +1527,7 @@ private:
         // 最终由 Forge/FML 抛出难以定位的 "your vanilla jar may be corrupt"。
         if (GetFileAttributesW(versionJar.c_str()) == INVALID_FILE_ATTRIBUTES) {
             WriteLaunchLog("缺失游戏核心 JAR: " + Core::StringUtils::WideToUtf8(versionJar));
+            missingTotal++;
             missingFiles.push_back(Core::StringUtils::WideToUtf8(versionJar));
         }
 
@@ -753,8 +1547,6 @@ private:
 
         if (!assetIndexObj.empty()) {
             std::string assetIndexId = assetIndexObj.value("id", "");
-            std::string assetIndexUrl = assetIndexObj.value("url", "");
-            std::string assetIndexSha1 = assetIndexObj.value("sha1", "");
 
             if (!assetIndexId.empty()) {
                 std::wstring indexPath = indexesDir + L"\\" + Core::StringUtils::Utf8ToWide(assetIndexId) + L".json";
@@ -762,21 +1554,8 @@ private:
                 DWORD indexAttr = GetFileAttributesW(indexPath.c_str());
                 if (indexAttr == INVALID_FILE_ATTRIBUTES) {
                     WriteLaunchLog("缺失资源索引: " + assetIndexId);
-                    if (!assetIndexUrl.empty()) {
-                        Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(assetIndexUrl));
-                        if (res.status == 200 && !res.body.empty()) {
-                            if (!assetIndexSha1.empty()) {
-                                std::string actualSha1 = Core::HashUtils::ComputeSHA1(res.body);
-                                if (actualSha1 != assetIndexSha1) {
-                                    WriteLaunchLog("  资源索引 SHA-1 校验失败!");
-                                    missingFiles.push_back("assets/indexes/" + assetIndexId + ".json");
-                                }
-                            }
-                            CreateDirectoryW(indexesDir.c_str(), nullptr);
-                            Core::FileManager::SaveFile(indexPath, res.body);
-                            WriteLaunchLog("  资源索引下载完成");
-                        }
-                    }
+                    missingTotal++;
+                    missingFiles.push_back("assets/indexes/" + assetIndexId + ".json");
                 }
 
                 std::ifstream indexFile(indexPath);
@@ -805,18 +1584,11 @@ private:
                             DWORD objAttr = GetFileAttributesW(objPath.c_str());
                             if (objAttr == INVALID_FILE_ATTRIBUTES) {
                                 missingAssets++;
-                                // 使用下载源管理器获取资源文件URL（支持镜像故障转移）
-                                std::vector<std::string> objUrls = Core::DownloadSourceManager::GetResourceMirrorUrls(prefix, hash);
-                                std::string objUrl = objUrls.empty() ? "" : objUrls[0];
-                                if (!objUrl.empty()) {
-                                    Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(objUrl));
-                                    if (res.status == 200 && !res.body.empty()) {
-                                        std::wstring objDir = objectsDir + L"\\" + Core::StringUtils::Utf8ToWide(prefix);
-                                        CreateDirectoryW(objDir.c_str(), nullptr);
-                                        Core::FileManager::SaveFile(objPath, res.body);
-                                    } else {
-                                        missingFiles.push_back("assets/objects/" + prefix + "/" + hash);
-                                    }
+                                missingTotal++;
+                                // 资源文件动辄上千个，逐条塞进提示和日志会把两边都撑爆，
+                                // 只留前 20 条做样例，真实数量看 missingTotal
+                                if (missingAssets <= 20) {
+                                    missingFiles.push_back("assets/objects/" + prefix + "/" + hash);
                                 }
                             }
                         }
@@ -826,13 +1598,19 @@ private:
             }
         }
 
-        if (!missingFiles.empty()) {
-            WriteLaunchLog("--- 文件检查完成 ---");
-            WriteLaunchLog("有 " + std::to_string(missingFiles.size()) + " 个文件无法修复:");
+        if (missingTotal > 0) {
+            WriteLaunchLog("--- 文件完整性校验未通过 ---");
+            WriteLaunchLog("缺失 " + std::to_string(missingTotal) + " 个文件:");
             for (const auto& f : missingFiles) {
                 WriteLaunchLog("  - " + f);
             }
-            return {{"ok", false}, {"error", "Missing files: " + std::to_string(missingFiles.size())}};
+            // 启动路径不再隐式补下载：让用户回下载页把版本下完，比在这里静默拉取上千个文件好定位，
+            // 也不会再把版本目录长时间占住
+            return {{"ok", false},
+                    {"missingCount", missingTotal},
+                    {"missing", missingFiles},
+                    {"error", "版本文件不完整：缺少 " + std::to_string(missingTotal) +
+                              " 个文件，请先到「下载」页重新下载该版本再启动"}};
         }
 
         WriteLaunchLog("--- 文件完整性检查通过 ---");
@@ -943,8 +1721,21 @@ private:
                 }
             }
 
+        // 现代 Forge / NeoForge 用 BootstrapLauncher + 模块层：打过补丁的客户端
+        // （forge-*-client.jar，由安装器的 processors 生成）已经在 libraries 里、
+        // 由 Forge 以 `minecraft` 模块提供 net.minecraft.* 。
+        // 这时再把原版 client jar 塞进 classpath，它会被当成自动模块 `_1._20._1`，
+        // 和 Forge 的 minecraft 模块重复导出同一个包，启动直接崩在：
+        //   java.lang.module.ResolutionException: Modules minecraft and _1._20_1
+        //   export package net.minecraft.client to module ...
+        // 而老版 Forge（LaunchWrapper）和 Fabric / Quilt 都必须在 classpath 上
+        // 看到原版 jar，所以只对 BootstrapLauncher 排除。
+        const bool needsVanillaJarOnClasspath =
+            mainClass.find("bootstraplauncher") == std::string::npos;
+
         // 添加版本 JAR
-        if (GetFileAttributesW(versionJar.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (needsVanillaJarOnClasspath &&
+            GetFileAttributesW(versionJar.c_str()) != INVALID_FILE_ATTRIBUTES) {
             classpath.push_back(Core::StringUtils::WideToUtf8(versionJar));
         }
 
@@ -1033,33 +1824,72 @@ private:
             WriteLaunchLog("检测到模组加载器版本, 继承自: " + vj.value("inheritsFrom", std::string()));
         }
 
-        // 构建游戏参数
-        std::string gameArgs;
-        if (vj.contains("arguments") && vj["arguments"].is_object() && vj["arguments"].contains("game")) {
-            for (const auto& arg : vj["arguments"]["game"]) {
-                if (arg.is_string()) {
-                    gameArgs += " " + arg.get<std::string>();
-                } else if (arg.is_object() && arg.contains("value")) {
-                    if (arg["value"].is_string()) {
-                        gameArgs += " " + arg["value"].get<std::string>();
-                    } else if (arg["value"].is_array()) {
-                        for (const auto& v : arg["value"]) {
-                            gameArgs += " " + v.get<std::string>();
-                        }
-                    }
-                }
-            }
-        } else if (vj.contains("minecraftArguments")) {
-            gameArgs = " " + vj["minecraftArguments"].get<std::string>();
-        }
+        GameSettings settings = ReadGameSettings(config);
+        // 我们总有一个目标窗口尺寸（默认 854x480 / 自定义 / 全屏），
+        // 因此 has_custom_resolution 一律上报为真，让原版 JSON 里那对
+        // --width/--height 规则命中；否则窗口尺寸就完全交给游戏自己的 options.txt
+        const bool customResolution = true;
 
         std::string assetsDirPath = Core::StringUtils::WideToUtf8(minecraftDir) + "\\assets";
-        std::string gameDir = Core::StringUtils::WideToUtf8(minecraftDir);
+        // 版本隔离：开启后该版本的存档 / 配置 / 模组都落在自己的版本文件夹里，
+        // 关闭时所有版本共用 .minecraft。整合包实例自带强制隔离标记，不受全局开关影响
+        const bool isolated = ShouldIsolateVersion(settings.versionIsolation, isDerivedVersion) ||
+                              IsForceIsolated(vj);
+        std::string gameDir = isolated ? Core::StringUtils::WideToUtf8(versionDir)
+                                       : Core::StringUtils::WideToUtf8(minecraftDir);
+        if (isolated) {
+            WriteLaunchLog("版本隔离已开启, 游戏目录: " + gameDir);
+        }
+        // 游戏目录里没有 options.txt 时首次启动会弹英文无障碍引导页，启动前先补上语言设置
+        EnsureGameOptionsFile(gameDir, settings.language);
         // assetIndex: 优先从当前版本 JSON 读取, 否则从原版 JSON 读取
         std::string assetIndex = vj.contains("assetIndex") ? vj["assetIndex"].value("id", "") : "";
         if (assetIndex.empty() && parentVj.contains("assetIndex")) {
             assetIndex = parentVj["assetIndex"].value("id", "");
             WriteLaunchLog("assetIndex 从原版 JSON 读取: " + assetIndex);
+        }
+
+        // 游戏参数：父版本（原版）在前、当前版本在后，两侧都要收。
+        // 加载器版本自己只声明增量（Forge 的 --launchTarget / --fml.*），
+        // --username / --gameDir / --userType 这些全在原版 JSON 里，不合并就会丢。
+        std::vector<std::string> gameArgList;
+        auto collectGameArgs = [&gameArgList, customResolution](const nlohmann::json& src) {
+            if (!src.is_object() || !src.contains("arguments") || !src["arguments"].is_object()) return;
+            const nlohmann::json& args = src["arguments"];
+            if (!args.contains("game") || !args["game"].is_array()) return;
+
+            for (const auto& arg : args["game"]) {
+                if (arg.is_string()) {
+                    gameArgList.push_back(arg.get<std::string>());
+                } else if (arg.is_object()) {
+                    if (!CheckArgRules(arg, customResolution)) continue;
+                    if (!arg.contains("value")) continue;
+
+                    if (arg["value"].is_string()) {
+                        gameArgList.push_back(arg["value"].get<std::string>());
+                    } else if (arg["value"].is_array()) {
+                        for (const auto& v : arg["value"]) {
+                            if (v.is_string()) gameArgList.push_back(v.get<std::string>());
+                        }
+                    }
+                }
+            }
+        };
+        collectGameArgs(parentVj);
+        collectGameArgs(vj);
+
+        if (gameArgList.empty()) {
+            // 旧版（1.12.2 及更早）只有 minecraftArguments 一个字符串，加载器版本会
+            // 在原版串的基础上追加 --tweakClass，所以优先用当前版本的
+            std::string legacy;
+            if (vj.contains("minecraftArguments") && vj["minecraftArguments"].is_string()) {
+                legacy = vj["minecraftArguments"].get<std::string>();
+            } else if (parentVj.contains("minecraftArguments") && parentVj["minecraftArguments"].is_string()) {
+                legacy = parentVj["minecraftArguments"].get<std::string>();
+            }
+            std::stringstream legacySS(legacy);
+            std::string token;
+            while (legacySS >> token) gameArgList.push_back(token);
         }
 
         auto replaceAll = [](std::string& str, const std::string& from, const std::string& to) {
@@ -1109,284 +1939,268 @@ private:
             out += "\"" + escaped + "\"\n";
         };
 
-        std::vector<std::string> jvmArgsList;
-        if (isDerivedVersion) {
-            // 合并父版本（原版）与当前版本的 arguments.jvm，父在前、子在后。
-            // 加载器版本往往只声明增量参数：Forge 1.21 自己只写了
-            // -Djava.net.preferIPv6Addresses，而 natives 提取路径(-Djna.tmpdir /
-            // -Dorg.lwjgl.system.SharedLibraryExtractPath / -Dio.netty.native.workdir)
-            // 都在原版 JSON 里，不合并就会丢。
-            std::vector<std::string> rawValues;
-            auto collectJvmArgs = [&rawValues](const nlohmann::json& src) {
-                if (!src.is_object() || !src.contains("arguments") || !src["arguments"].is_object()) return;
-                const nlohmann::json& args = src["arguments"];
-                if (!args.contains("jvm") || !args["jvm"].is_array()) return;
-                for (const auto& arg : args["jvm"]) {
-                    if (arg.is_string()) {
-                        rawValues.push_back(arg.get<std::string>());
-                    } else if (arg.is_object()) {
-                        if (!CheckArgRules(arg)) continue;
-                        if (!arg.contains("value")) continue;
-                        if (arg["value"].is_string()) {
-                            rawValues.push_back(arg["value"].get<std::string>());
-                        } else if (arg["value"].is_array()) {
-                            for (const auto& v : arg["value"]) {
-                                if (v.is_string()) rawValues.push_back(v.get<std::string>());
-                            }
+        // ==================== JVM 参数 ====================
+        // 原版和模组一视同仁地读 arguments.jvm：原版 JSON 里的
+        // -Djna.tmpdir / -Dorg.lwjgl.system.SharedLibraryExtractPath /
+        // -Dio.netty.native.workdir / -Dminecraft.launcher.brand 等
+        // 决定了原生库解压到哪里，只扫加载器版本会把它们整段丢掉。
+        // 加载器版本往往只声明增量，所以要合并父版本（原版），父在前、子在后。
+        std::vector<std::string> rawJvmValues;
+        auto collectJvmArgs = [&rawJvmValues, customResolution](const nlohmann::json& src) {
+            if (!src.is_object() || !src.contains("arguments") || !src["arguments"].is_object()) return;
+            const nlohmann::json& args = src["arguments"];
+            if (!args.contains("jvm") || !args["jvm"].is_array()) return;
+
+            for (const auto& arg : args["jvm"]) {
+                if (arg.is_string()) {
+                    rawJvmValues.push_back(arg.get<std::string>());
+                } else if (arg.is_object()) {
+                    if (!CheckArgRules(arg, customResolution)) continue;
+                    if (!arg.contains("value")) continue;
+
+                    if (arg["value"].is_string()) {
+                        rawJvmValues.push_back(arg["value"].get<std::string>());
+                    } else if (arg["value"].is_array()) {
+                        for (const auto& v : arg["value"]) {
+                            if (v.is_string()) rawJvmValues.push_back(v.get<std::string>());
                         }
                     }
                 }
-            };
-            collectJvmArgs(parentVj);
-            collectJvmArgs(vj);
-
-            for (auto value : rawValues) {
-                if (value.empty()) continue;
-                substituteLoaderValue(value);
-                jvmArgsList.push_back(value);
-            }
-            if (!jvmArgsList.empty()) {
-                WriteLaunchLog("合并后的 JVM 参数: " + std::to_string(jvmArgsList.size()) + " 项");
-            }
-        }
-
-        replaceAll(gameArgs, "${auth_player_name}", username);
-        replaceAll(gameArgs, "${auth_uuid}", uuid);
-        replaceAll(gameArgs, "${auth_access_token}", "0");
-        replaceAll(gameArgs, "${auth_session}", "0");
-        replaceAll(gameArgs, "${game_directory}", gameDir);
-        replaceAll(gameArgs, "${assets_root}", assetsDirPath);
-        replaceAll(gameArgs, "${assets_index_name}", assetIndex);
-        replaceAll(gameArgs, "${version_name}", profileName);
-        replaceAll(gameArgs, "${user_properties}", "{}");
-        replaceAll(gameArgs, "${user_type}", "mojang");
-        replaceAll(gameArgs, "${version_type}", vj.value("type", "release"));
-
-        replaceAll(gameArgs, "${clientid}", "");
-        replaceAll(gameArgs, "${auth_xuid}", "");
-        replaceAll(gameArgs, "${resolution_width}", "");
-        replaceAll(gameArgs, "${resolution_height}", "");
-        replaceAll(gameArgs, "${launcher_name}", "");
-        replaceAll(gameArgs, "${launcher_version}", "");
-
-        size_t pos = 0;
-        while ((pos = gameArgs.find("${", pos)) != std::string::npos) {
-            size_t end = gameArgs.find("}", pos);
-            if (end != std::string::npos) {
-                gameArgs.erase(pos, end - pos + 1);
-            } else {
-                break;
-            }
-        }
-
-        auto removeArg = [&gameArgs](const std::string& arg) {
-            size_t pos;
-            while ((pos = gameArgs.find(arg)) != std::string::npos) {
-                size_t start = pos;
-                while (start > 0 && gameArgs[start - 1] == ' ') start--;
-
-                size_t end = pos + arg.length();
-                while (end < gameArgs.length() && gameArgs[end] == ' ') end++;
-                while (end < gameArgs.length() && gameArgs[end] != ' ') end++;
-
-                gameArgs.erase(start, end - start);
             }
         };
+        collectJvmArgs(parentVj);
+        collectJvmArgs(vj);
 
-        removeArg("--clientId");
-        removeArg("--xuid");
-        removeArg("--demo");
-        removeArg("--width");
-        removeArg("--height");
-
-        while ((pos = gameArgs.find("--quickPlay")) != std::string::npos) {
-            size_t start = pos;
-            while (start > 0 && gameArgs[start - 1] == ' ') start--;
-
-            size_t end = pos + 11;
-            while (end < gameArgs.length() && gameArgs[end] != ' ') end++;
-
-            gameArgs.erase(start, end - start);
+        // 1.13 以前没有 arguments.jvm，只补最基础的两条（原版启动器当年也是这么做的）
+        if (rawJvmValues.empty()) {
+            rawJvmValues.push_back("-Djava.library.path=${natives_directory}");
+            rawJvmValues.push_back("-cp");
+            rawJvmValues.push_back("${classpath}");
         }
 
-        while (gameArgs.find("  ") != std::string::npos) {
-            replaceAll(gameArgs, "  ", " ");
+        std::vector<std::string> jvmArgsList;
+        for (auto value : rawJvmValues) {
+            if (value.empty()) continue;
+            substituteLoaderValue(value);
+            jvmArgsList.push_back(value);
+        }
+        WriteLaunchLog("JVM 参数: " + std::to_string(jvmArgsList.size()) + " 项");
+
+        // ==================== 占位符替换 ====================
+        const std::string versionType = vj.value("type", std::string("release"));
+
+        ArgValues argValues;
+        argValues.username = username;
+        argValues.uuid = uuid;
+        argValues.accessToken = (isMsaAccount || isYggdrasilAccount) ? accessToken : "0";
+        argValues.userType = userType;
+        argValues.xuid = xuid;
+        argValues.gameDir = gameDir;
+        argValues.assetsDir = assetsDirPath;
+        argValues.assetIndex = assetIndex;
+        argValues.versionName = profileName;
+        argValues.versionType = versionType;
+        argValues.resolutionWidth = std::to_string(settings.windowWidth);
+        argValues.resolutionHeight = std::to_string(settings.windowHeight);
+        argValues.primaryJar = Core::StringUtils::WideToUtf8(versionJar);
+        argValues.gameAssetsDir = Core::StringUtils::WideToUtf8(minecraftDir) + "\\assets\\virtual\\legacy";
+        argValues.librariesDir = libsDirStr;
+        SubstituteGameArgs(gameArgList, argValues);
+
+        // 原版参数兜底：版本 JSON（或它的父版本）没提供时至少保证游戏能拿到必需参数。
+        // 正常安装下这些全部由版本清单提供，下面只会补上 --logFile
+        std::set<std::string> presentFlags;
+        for (const std::string& arg : gameArgList) {
+            if (arg.size() > 2 && arg[0] == '-' && arg[1] == '-') presentFlags.insert(arg);
+        }
+        auto ensurePair = [&gameArgList, &presentFlags](const std::string& flag, const std::string& value) {
+            if (value.empty() || presentFlags.count(flag)) return;
+            gameArgList.push_back(flag);
+            gameArgList.push_back(value);
+            presentFlags.insert(flag);
+        };
+        ensurePair("--gameDir", gameDir);
+        ensurePair("--assetsDir", assetsDirPath);
+        ensurePair("--assetIndex", assetIndex);
+        ensurePair("--username", username);
+        ensurePair("--uuid", uuid);
+        ensurePair("--accessToken", argValues.accessToken);
+        ensurePair("--userType", userType);
+        ensurePair("--version", profileName);
+        ensurePair("--versionType", versionType);
+
+        // 窗口尺寸：旧版清单里没有这对参数，按设置补上
+        if (settings.windowMode != "fullscreen") {
+            ensurePair("--width", argValues.resolutionWidth);
+            ensurePair("--height", argValues.resolutionHeight);
         }
 
-        while (!gameArgs.empty() && gameArgs.front() == ' ') gameArgs.erase(0, 1);
-        while (!gameArgs.empty() && gameArgs.back() == ' ') gameArgs.pop_back();
+        std::string logsLatestPath = Core::StringUtils::WideToUtf8(minecraftDir) + "\\logs\\latest.log";
+        ensurePair("--logFile", logsLatestPath);
+
+        // --launchTarget 是 Forge / ModLauncher 专有参数，只有引导类才补，
+        // 否则 Fabric 之类会把未知参数透传给游戏主类导致启动报错。
+        bool hasLaunchTarget = false;
+        for (const std::string& arg : gameArgList) {
+            if (arg == "--launchTarget") hasLaunchTarget = true;
+        }
+        bool isForgeLikeLauncher =
+            mainClass == "net.minecraftforge.bootstrap.ForgeBootstrap" ||
+            mainClass.find("bootstraplauncher") != std::string::npos ||
+            mainClass.find("fml.loading.ModLauncher") != std::string::npos;
+        if (!hasLaunchTarget && isForgeLikeLauncher) {
+            gameArgList.push_back("--launchTarget");
+            gameArgList.push_back("forgeclient");
+        }
+
+        if (settings.windowMode == "fullscreen") {
+            gameArgList.push_back("--fullscreen");
+        }
 
         // 启动游戏
         std::wstring logsDir = minecraftDir + L"\\logs";
         CreateDirectoryW(logsDir.c_str(), nullptr);
 
-        std::string cmd;
-        if (!jvmArgsList.empty()) {
-            // ===== 模组加载器版本启动命令 (版本 JSON 自带 JVM 参数 + @argfile) =====
-            // 加载器版本通过 arguments.jvm 提供 --module-path / -DignoreList /
-            // -DlibraryDirectory / -DFabricMcEmu 等必需参数，参数长且可能含空格，
-            // 因此写入 @argfile（按行解析，每行即一个参数，无需转义）。
+        std::string exeDir = Core::StringUtils::WideToUtf8(Core::FileManager::GetExeDir());
 
-            std::string exeDir = Core::StringUtils::WideToUtf8(Core::FileManager::GetExeDir());
-
-            // 1. 使用已构建的 classpath (来自 mergedLibs, 已包含原版+加载器依赖)
+        // classpath：加载器版本做模块去重并转成相对路径（参数更短），
+        // 原版沿用绝对路径，两边都保持改动前的取值方式
+        std::string pathStr;
+        if (isDerivedVersion) {
             std::vector<std::string> allJars = classpath;
-
-            // 2. 添加版本 JAR (如果不在列表中) — 复用上方按实际命名解析出的游戏核心 jar
             std::string versionJarStr = Core::StringUtils::WideToUtf8(versionJar);
-            if (GetFileAttributesW(versionJar.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (needsVanillaJarOnClasspath &&
+                GetFileAttributesW(versionJar.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 bool found = false;
-                for (const auto& j : allJars) {
-                    if (j == versionJarStr) { found = true; break; }
+                for (const auto& jar : allJars) {
+                    if (jar == versionJarStr) { found = true; break; }
                 }
                 if (!found) allJars.push_back(versionJarStr);
             }
-
-            WriteLaunchLog("依赖 jar 数量: " + std::to_string(allJars.size()));
-
-            // 3. 模块去重 (纯字符串解析, 无 I/O)
             std::vector<std::string> dedupedJars = BuildDeduplicatedClasspath(libsBase, allJars);
-            WriteLaunchLog("去重后 jar 数量: " + std::to_string(dedupedJars.size()));
-
-            // 4. 构建相对路径的 classpath 字符串
-            std::string pathStr;
+            WriteLaunchLog("依赖 jar 数量: " + std::to_string(allJars.size()) +
+                           ", 去重后: " + std::to_string(dedupedJars.size()));
             for (size_t i = 0; i < dedupedJars.size(); i++) {
                 if (i > 0) pathStr += ";";
-                pathStr += MakeRelativePath(dedupedJars[i], exeDir);
+                // 必须用绝对路径：游戏进程的 CWD 现在是游戏目录，
+                // 相对路径会被解析到 versions\<实例>\ 下面去
+                pathStr += dedupedJars[i];
             }
-
-            // 5. 构建 argfile
-            // 合并进来的参数可能已经提供 classpath 与 java.library.path
-            // （原版 JSON 的 "-cp ${classpath}" 与 "-Djava.library.path=${natives_directory}"），
-            // 此时不要重复添加，避免依赖"后者覆盖前者"的巧合。
-            bool argsHaveClasspath = false;
-            bool argsHaveLibraryPath = false;
-            for (const auto& jvmArg : jvmArgsList) {
-                if (jvmArg.rfind("-Djava.library.path=", 0) == 0) argsHaveLibraryPath = true;
-                if (jvmArg == "-cp" || jvmArg == "-classpath" ||
-                    jvmArg.rfind("-cp=", 0) == 0 || jvmArg.rfind("-classpath=", 0) == 0) {
-                    argsHaveClasspath = true;
-                }
-            }
-
-            std::string argfile;
-            appendArgfileArg(argfile, "-Xmx4G");
-            appendArgfileArg(argfile, "-Djava.awt.headless=false");
-            appendArgfileArg(argfile, "-Dorg.lwjgl.util.Debug=true");
-            if (!argsHaveLibraryPath) {
-                appendArgfileArg(argfile, "-Djava.library.path=" + MakeRelativePath(nativesDirStr, exeDir));
-            }
-            if (supportsNativeAccess) {
-                appendArgfileArg(argfile, "--enable-native-access=ALL-UNNAMED");
-            }
-            for (auto jvmArg : jvmArgsList) {
-                replaceAll(jvmArg, "${classpath}", pathStr);
-                appendArgfileArg(argfile, jvmArg);
-            }
-            if (!argsHaveClasspath) {
-                appendArgfileArg(argfile, "-cp");
-                appendArgfileArg(argfile, pathStr);
-            }
-            appendArgfileArg(argfile, mainClass);
-
-            // 6. 版本 JSON 的 game 参数 (Forge 的 --launchTarget / --fml.* 等)
-            bool hasLaunchTarget = false;
-            if (vj.contains("arguments") && vj["arguments"].is_object() && vj["arguments"].contains("game")) {
-                for (const auto& arg : vj["arguments"]["game"]) {
-                    std::vector<std::string> values;
-                    if (arg.is_string()) {
-                        values.push_back(arg.get<std::string>());
-                    } else if (arg.is_object() && arg.contains("value")) {
-                        if (arg["value"].is_string()) {
-                            values.push_back(arg["value"].get<std::string>());
-                        } else if (arg["value"].is_array()) {
-                            for (const auto& v : arg["value"]) {
-                                if (v.is_string()) values.push_back(v.get<std::string>());
-                            }
-                        }
-                    }
-                    for (auto value : values) {
-                        if (value.empty()) continue;
-                        substituteLoaderValue(value);
-                        if (value == "--launchTarget") hasLaunchTarget = true;
-                        appendArgfileArg(argfile, value);
-                    }
-                }
-            }
-
-            // --launchTarget 是 Forge / ModLauncher 专有参数，只有引导类才补，
-            // 否则 Fabric 之类会把未知参数透传给游戏主类导致启动报错。
-            bool isForgeLikeLauncher =
-                mainClass == "net.minecraftforge.bootstrap.ForgeBootstrap" ||
-                mainClass.find("bootstraplauncher") != std::string::npos ||
-                mainClass.find("fml.loading.ModLauncher") != std::string::npos;
-            if (!hasLaunchTarget && isForgeLikeLauncher) {
-                appendArgfileArg(argfile, "--launchTarget");
-                appendArgfileArg(argfile, "forgeclient");
-            }
-
-            appendArgfileArg(argfile, "--gameDir");
-            appendArgfileArg(argfile, MakeRelativePath(gameDir, exeDir));
-            appendArgfileArg(argfile, "--assetsDir");
-            appendArgfileArg(argfile, MakeRelativePath(assetsDirPath, exeDir));
-            appendArgfileArg(argfile, "--assetIndex");
-            appendArgfileArg(argfile, assetIndex);
-            appendArgfileArg(argfile, "--username");
-            appendArgfileArg(argfile, username);
-            appendArgfileArg(argfile, "--uuid");
-            appendArgfileArg(argfile, uuid);
-            appendArgfileArg(argfile, "--accessToken");
-            appendArgfileArg(argfile, "0");
-            appendArgfileArg(argfile, "--version");
-            appendArgfileArg(argfile, profileName);
-            appendArgfileArg(argfile, "--versionType");
-            appendArgfileArg(argfile, vj.value("type", "release"));
-            appendArgfileArg(argfile, "--logFile");
-            appendArgfileArg(argfile, MakeRelativePath(Core::StringUtils::WideToUtf8(minecraftDir) + "\\logs\\latest.log", exeDir));
-
-            // 7. 写入 argfile
-            std::wstring argfileDir = minecraftDir + L"\\temp";
-            CreateDirectoryW(argfileDir.c_str(), nullptr);
-            std::wstring argfilePath = argfileDir + L"\\loader_launch.argfile";
-            {
-                std::ofstream argfileOut(argfilePath);
-                if (argfileOut.is_open()) {
-                    argfileOut << argfile;
-                    argfileOut.close();
-                    WriteLaunchLog("argfile 已写入: " + Core::StringUtils::WideToUtf8(argfilePath));
-                } else {
-                    WriteLaunchLog("警告: argfile 写入失败, 回退到直接命令行模式");
-                    cmd = "\"" + javaPath + "\" -cp \"" + classpathStr + "\" " + mainClass +
-                          (gameArgs.empty() ? "" : " " + gameArgs);
-                }
-            }
-
-            if (cmd.empty()) {
-                std::string argfileRel = MakeRelativePath(Core::StringUtils::WideToUtf8(argfilePath), exeDir);
-                cmd = "\"" + javaPath + "\" @" + argfileRel;
-            }
-
-            WriteLaunchLog("使用加载器声明参数启动 (@argfile)");
         } else {
-            // ===== 普通版本启动命令 (传统 classpath 方式) =====
-            cmd = "\"" + javaPath + "\"";
-            cmd += " -Djava.awt.headless=false";
-            cmd += " -Dorg.lwjgl.util.Debug=true";
-            cmd += " -Djava.library.path=\"" + Core::StringUtils::WideToUtf8(nativesDir) + "\"";
-            if (supportsNativeAccess) {
-                cmd += " --enable-native-access=ALL-UNNAMED";
-            }
-            cmd += " -cp \"" + classpathStr + "\"";
-            cmd += " " + mainClass;
-            if (!gameArgs.empty()) {
-                cmd += " " + gameArgs;
-            }
-            cmd += " --logFile \"" + Core::StringUtils::WideToUtf8(minecraftDir) + "\\logs\\latest.log\"";
+            pathStr = classpathStr;
         }
 
-        WriteLaunchLog("启动命令: " + cmd);
+        // 合并进来的 JVM 参数可能已经自带 classpath 与 java.library.path
+        // （原版 JSON 的 "-cp ${classpath}" 与 "-Djava.library.path=${natives_directory}"），
+        // 此时不要重复添加，避免依赖"后者覆盖前者"的巧合。
+        bool argsHaveClasspath = false;
+        bool argsHaveLibraryPath = false;
+        for (const std::string& jvmArg : jvmArgsList) {
+            if (jvmArg.rfind("-Djava.library.path=", 0) == 0) argsHaveLibraryPath = true;
+            if (jvmArg == "-cp" || jvmArg == "-classpath" ||
+                jvmArg.rfind("-cp=", 0) == 0 || jvmArg.rfind("-classpath=", 0) == 0) {
+                argsHaveClasspath = true;
+            }
+        }
 
-        std::wstring workDir = Core::FileManager::GetExeDir();
+        const int memoryMb = settings.maxMemoryMb > 0
+            ? settings.maxMemoryMb
+            : ComputeAutoMemoryMb(isDerivedVersion, Core::StringUtils::Utf8ToWide(gameDir));
+        WriteLaunchLog("游戏内存: " + std::to_string(memoryMb) + " MB" +
+                       (settings.maxMemoryMb > 0 ? "" : " (自动)"));
+
+        // ==================== 装配最终参数 ====================
+        // 原版与模组走同一条管线，只在"怎么把参数交给 JVM"上分叉：
+        // Java 9+ 有 @argfile（按行解析，免转义，参数再长也不受命令行长度限制），
+        // Java 8 没有这个特性，只能拼命令行并自行加引号。
+        std::vector<std::string> finalArgs;
+        finalArgs.push_back("-Xmx" + std::to_string(memoryMb) + "M");
+        finalArgs.push_back("-Djava.awt.headless=false");
+        if (!argsHaveLibraryPath) {
+            finalArgs.push_back("-Djava.library.path=" + nativesDirStr);
+        }
+        if (supportsNativeAccess) {
+            finalArgs.push_back("--enable-native-access=ALL-UNNAMED");
+        }
+        // 外置登录：注入 authlib-injector，让游戏把验证请求交给第三方服务器。
+        // ⚠ 等号右边必须是探测后确认的完整 API 根地址（不是用户填的站点地址），
+        // 否则游戏的验证请求会打到错误的地方，表现为"进服失败"而不是启动失败。
+        // 放在 jvmArgsList 之前：-javaagent 属于 JVM 参数，必须在主类之前
+        if (isYggdrasilAccount) {
+            if (yggdrasilApiRoot.empty()) {
+                WriteLaunchLog("错误: 外置登录账号缺少 API 根地址");
+                return {{"ok", false}, {"error", "外置登录账号缺少验证服务器地址，请重新登录"}};
+            }
+            std::string jarError;
+            const std::string jarPath = Core::AuthlibInjector::EnsureJar(jarError);
+            if (jarPath.empty()) {
+                WriteLaunchLog("错误: " + jarError);
+                return {{"ok", false}, {"error", jarError}};
+            }
+            finalArgs.push_back("-javaagent:" + jarPath + "=" + yggdrasilApiRoot);
+            WriteLaunchLog("已注入 authlib-injector, API 根地址: " + yggdrasilApiRoot);
+        }
+        for (std::string jvmArg : jvmArgsList) {
+            replaceAll(jvmArg, "${classpath}", pathStr);
+            finalArgs.push_back(jvmArg);
+        }
+        if (!argsHaveClasspath) {
+            finalArgs.push_back("-cp");
+            finalArgs.push_back(pathStr);
+        }
+        finalArgs.push_back(mainClass);
+        finalArgs.insert(finalArgs.end(), gameArgList.begin(), gameArgList.end());
+
+        std::string cmd;
+        // argfile 的路径要在启动后删掉它，所以提到外面声明
+        std::wstring argfilePath;
+        const bool useArgfile = !(javaMajor > 0 && javaMajor < 9);
+        if (useArgfile) {
+            std::string argfile;
+            for (const std::string& arg : finalArgs) appendArgfileArg(argfile, arg);
+
+            std::wstring argfileDir = minecraftDir + L"\\temp";
+            CreateDirectoryW(argfileDir.c_str(), nullptr);
+            argfilePath = argfileDir + L"\\launch.argfile";
+            std::ofstream argfileOut(argfilePath);
+            if (argfileOut.is_open()) {
+                argfileOut << argfile;
+                argfileOut.close();
+                WriteLaunchLog("argfile 已写入: " + Core::StringUtils::WideToUtf8(argfilePath));
+                // argfile 同样要绝对路径（CWD 现在是游戏目录）。
+                // 不能加引号 —— Java 的 @argfile 不会剥引号，
+                // 实测 @"C:\path with space\x.txt" 会报 could not open；
+                // 不加引号时空格路径反而正常
+                cmd = "\"" + javaPath + "\" @" + Core::StringUtils::WideToUtf8(argfilePath);
+            } else {
+                // argfile 写不进去（权限 / 磁盘）时退化成命令行，至少别让启动直接失败
+                WriteLaunchLog("警告: argfile 写入失败, 回退到直接命令行模式");
+            }
+        } else {
+            WriteLaunchLog("Java " + std::to_string(javaMajor) + " 不支持 @argfile, 使用直接命令行模式");
+        }
+
+        if (cmd.empty()) {
+            cmd = "\"" + javaPath + "\"";
+            for (const std::string& arg : finalArgs) {
+                if (arg.empty()) {
+                    cmd += " \"\"";
+                } else if (arg.find_first_of(" \t") != std::string::npos) {
+                    cmd += " \"" + arg + "\"";
+                } else {
+                    cmd += " " + arg;
+                }
+            }
+        }
+
+        WriteLaunchLog("启动命令: " + RedactCommandSecrets(cmd));
+
+        // 游戏进程的工作目录必须是**游戏目录**，绝不能是 exe 所在目录。
+        // 不少模组（Jupiter、FancyMenu 等）用 "./config/xxx.json" 这种相对路径
+        // 读配置：CWD 不对就读不到，FancyMenu 的 customizableScreens 会一直是
+        // null，接着 DrippyLoadingScreen 在 LoadingOverlay 的静态初始化里空指针，
+        // 表现为"进游戏就崩"。PCL 等启动器都是把 CWD 设成游戏目录的。
+        std::wstring workDir = Core::StringUtils::Utf8ToWide(gameDir);
 
         std::wstring outputLogPath = logsDir + L"\\output.log";
         std::wstring errorLogPath = logsDir + L"\\error.log";
@@ -1440,7 +2254,7 @@ private:
         Bridge::WebviewBridge* bridge = &bridge_;
         tauricpp::App* app = g_app_ptr;
 
-        std::thread([hProcess, processId, bridge, app]() {
+        std::thread([hProcess, processId, bridge, app, argfilePath]() {
             // 等待游戏窗口出现或进程结束
             DWORD exitCode = 0;
             bool windowFound = false;
@@ -1494,6 +2308,8 @@ private:
                 if (gameWindow != nullptr && !windowFound) {
                     windowFound = true;
                     WriteLaunchLog("游戏窗口已出现");
+                    // 窗口都出来了，说明 JVM 早就读完参数，argfile 可以删了
+                    RemoveLaunchArgfile(argfilePath);
                     // 通知前端：游戏窗口已出现
                     nlohmann::json windowEvent = {{"phase", "launch"}, {"status", "window_ready"}, {"pid", (int)processId}};
                     if (app) {
@@ -1511,6 +2327,9 @@ private:
 
                 Sleep(100); // 每 100ms 检查一次
             }
+
+            // 兜底：没等到窗口（等待超时或进程直接退出）也要把 argfile 清掉
+            RemoveLaunchArgfile(argfilePath);
 
             // 等待进程完全结束
             WaitForSingleObject(hProcess, INFINITE);

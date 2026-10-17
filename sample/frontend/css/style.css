@@ -6,28 +6,48 @@
 
 /* ---- 设计令牌 ---- */
 :root {
+  /* 深色配色基座：原生下拉浮层、滚动条等跟随浅色文字 */
+  color-scheme: dark;
   /* 颜色 */
+  --bg-image: url("../resoures/background/pic1.svg");
   --bg-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  --glass: rgba(255, 255, 255, 0.15);
-  --glass-strong: rgba(255, 255, 255, 0.45);
+  /* 液态玻璃：全站共用一套材质，所有带 backdrop-filter 的元素都从这里取值。
+     模糊半径要小，否则背后的线条会被抹平成一块实心板；
+     saturate 拉高底色饱和度，玻璃感才成立 */
+  --glass-bg: rgba(255, 255, 255, 0.08);
+  --glass-blur: blur(4px) saturate(150%);
   --glass-border: rgba(255, 255, 255, 0.18);
-  --surface: rgba(255, 255, 255, 0.92);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.16);
+  --glass-radius: 28px;
+  --glass-row: rgba(255, 255, 255, 0.03);
+  --glass-row-hover: rgba(255, 255, 255, 0.14);
+  --glass-row-border: rgba(255, 255, 255, 0.14);
+  /* 选中态填充：半透明亮色玻璃，浅色文字才站得住 */
+  --surface: rgba(255, 255, 255, 0.22);
   --on-glass: #ffffff;
-  --text-strong: #1e293b;
-  --text: #334155;
-  --text-muted: #64748b;
-  --text-faint: #94a3b8;
-  --accent: #22c55e;
-  --accent-hover: #16a34a;
-  --info: #3b82f6;
-  --info-hover: #2563eb;
+  /* 文字层级：全部为浅色，靠不透明度拉开主次 */
+  --text-strong: rgba(255, 255, 255, 0.96);
+  --text: rgba(255, 255, 255, 0.88);
+  --text-muted: rgba(255, 255, 255, 0.68);
+  --text-faint: rgba(255, 255, 255, 0.5);
+  --accent: #00D4FF;
+  --accent-hover: #00A8CC;
+  /* --info 是中性色，不再是饱和蓝：品牌强调色已经是 #00D4FF，
+     再留一个饱和蓝会在同屏跟它撞色（下载中 / 成功、主按钮 / 次按钮都会分不出来） */
+  --info: #64748b;
+  --info-hover: #475569;
+  --info-soft: #94a3b8;
   --danger: #ef4444;
   --danger-hover: #dc2626;
   --warn: #f59e0b;
-  /* 圆角 */
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 14px;
+  /* 圆角：一条 6 级 + 两个特例的固定刻度，别再往中间插新数值。
+     毛玻璃面板用 --glass-radius(28px)，胶囊用 --radius-pill。 */
+  --radius-xs: 4px;    /* 徽标、小标签 */
+  --radius-sm: 6px;    /* 小按钮、行内控件 */
+  --radius-md: 8px;    /* 常规按钮、输入框 */
+  --radius-lg: 10px;   /* 列表行、卡片 */
+  --radius-xl: 12px;   /* 大按钮、内嵌面板 */
+  --radius-2xl: 14px;  /* 主页大按钮 */
   --radius-pill: 999px;
   /* 间距 */
   --space-1: 4px;
@@ -65,18 +85,138 @@ button:disabled {
   background: transparent;
 }
 
-/* 全局可见焦点 */
+/* 取消焦点环（含 Chromium 的默认焦点框） */
+:focus,
 :focus-visible {
-  outline: 2px solid #ffffff;
-  outline-offset: 2px;
-  border-radius: var(--radius-sm);
+  outline: none;
 }
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible,
-button:focus-visible {
-  outline: 2px solid #ffffff;
-  outline-offset: 2px;
+
+/* 所有下拉框统一套用玻璃模板 */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 36px;
+  padding: 0 30px 0 12px;
+  background-color: var(--glass-bg);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.75)' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px 12px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  color: var(--text-strong);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  outline: none;
+  transition: background-color 0.2s, border-color 0.2s;
+}
+
+select:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+select:disabled {
+  cursor: default;
+}
+
+/* 展开的原生浮层跟随深色配色（原生弹层的圆角/底色仍由系统绘制，改不了，
+   真正的玻璃弹层见下面的 .dropdown-panel） */
+select option {
+  background: #2a2a44;
+  color: #ffffff;
+}
+
+/* ---- 自绘下拉弹层 ---- */
+/* 原生 <select> 展开的列表是 Chromium 自己的浮层，CSS 只能影响文字颜色，
+   圆角、底色、阴影一概改不了。这里保留 <select> 作为数据模型（value / innerHTML /
+   options / change 全部照旧），只在它上面盖一层透明按钮接管点击，弹层自己画。 */
+.dropdown {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+
+.dropdown > select {
+  width: 100%;
+  pointer-events: none;
+}
+
+.dropdown-trigger {
+  position: absolute;
+  inset: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.dropdown:hover select,
+.dropdown:has(.dropdown-trigger.is-open) select {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.dropdown:has(select:disabled) .dropdown-trigger {
+  cursor: default;
+}
+
+.dropdown-panel {
+  position: fixed;
+  z-index: 300;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  /* 展开 / 收起只做 transform + opacity，不碰布局属性。
+     入场用 keyframes（只写 from，动画结束自然回到元素自身样式，
+     万一动画没跑也是可见的），退场用 transition + .is-closing */
+  transform-origin: top center;
+  transition: opacity 0.15s var(--ease-out), transform 0.15s var(--ease-out);
+  animation: dropdown-in 0.15s var(--ease-out);
+}
+
+.dropdown-panel.is-closing {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+
+@keyframes dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+
+.dropdown-option {
+  padding: 8px 12px;
+  /* 面板 28px 圆角减去 6px 内边距，内层才不会顶出面板 */
+  border-radius: calc(var(--glass-radius) - 6px);
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.dropdown-option:hover,
+.dropdown-option.is-active {
+  background-color: rgba(255, 255, 255, 0.14);
+  color: var(--text-strong);
+}
+
+.dropdown-option.is-selected {
+  color: var(--text-strong);
+  font-weight: 600;
 }
 
 /* 减弱动态效果 */
@@ -89,53 +229,29 @@ button:focus-visible {
   }
 }
 
-/* 共享滚动条样式 */
-.account-card-expand,
-.account-card-list,
-.version-card-expand,
-.download-content,
-.settings-content,
-.resource-content,
-.mod-results {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
+/* 全站滚动条：直接作用于所有滚动容器，不再逐个列举（漏一个就会退回原生样式）。
+   注意不要同时写 scrollbar-width / scrollbar-color —— 这两个标准属性一旦指定，
+   Chromium 会忽略 ::-webkit-scrollbar，反而退回原生滚动条。 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
 }
-.account-card-expand::-webkit-scrollbar,
-.account-card-list::-webkit-scrollbar,
-.version-card-expand::-webkit-scrollbar,
-.download-content::-webkit-scrollbar,
-.settings-content::-webkit-scrollbar,
-.resource-content::-webkit-scrollbar,
-.mod-results::-webkit-scrollbar {
-  width: 6px;
-}
-.account-card-expand::-webkit-scrollbar-track,
-.account-card-list::-webkit-scrollbar-track,
-.version-card-expand::-webkit-scrollbar-track,
-.download-content::-webkit-scrollbar-track,
-.settings-content::-webkit-scrollbar-track,
-.resource-content::-webkit-scrollbar-track,
-.mod-results::-webkit-scrollbar-track {
+
+::-webkit-scrollbar-track {
   background: rgba(255, 255, 255, 0.05);
 }
-.account-card-expand::-webkit-scrollbar-thumb,
-.account-card-list::-webkit-scrollbar-thumb,
-.version-card-expand::-webkit-scrollbar-thumb,
-.download-content::-webkit-scrollbar-thumb,
-.settings-content::-webkit-scrollbar-thumb,
-.resource-content::-webkit-scrollbar-thumb,
-.mod-results::-webkit-scrollbar-thumb {
+
+::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.2);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
 }
-.account-card-expand::-webkit-scrollbar-thumb:hover,
-.account-card-list::-webkit-scrollbar-thumb:hover,
-.version-card-expand::-webkit-scrollbar-thumb:hover,
-.download-content::-webkit-scrollbar-thumb:hover,
-.settings-content::-webkit-scrollbar-thumb:hover,
-.resource-content::-webkit-scrollbar-thumb:hover,
-.mod-results::-webkit-scrollbar-thumb:hover {
+
+::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.3);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html, body {
@@ -143,11 +259,16 @@ html, body {
   height: 100%;
   overflow: hidden;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  color: #1e293b;
+  color: var(--text-strong);
 }
 
+/* ---- 启动器背景：引用图片铺满窗口，渐变仅作兜底 ---- */
 body {
-  background: var(--bg-gradient);
+  background-color: #6a6cc4;
+  background-image: var(--bg-image), var(--bg-gradient);
+  background-size: cover;
+  background-position: center center;
+  background-repeat: no-repeat;
 }
 
 /* ---- 拖拽栏 ---- */
@@ -160,9 +281,11 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: rgba(255, 255, 255, 0.15);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
   z-index: 50;
 }
 
@@ -207,6 +330,11 @@ body {
 .btn-red { background: #ef4444; }
 
 /* ---- 通用图层 ---- */
+/* 图层容器本身不能做 opacity 过渡：只要动画期间有一帧 opacity < 1，
+   Chromium 就会把这个容器当成 backdrop-root，其内部 backdrop-filter 玻璃
+   只能采样到容器自身的内容（通常为空），于是整段动画里玻璃下方的模糊会消失。
+   淡入淡出必须落在玻璃元素自己身上（自身的 opacity 不影响自身的背景采样），
+   容器只用 visibility 做延后显隐。 */
 .layer {
   position: fixed;
   top: 32px;
@@ -216,15 +344,17 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  opacity: 0;
+  visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.3s var(--ease-out);
+  /* 等内部元素淡出结束后再隐藏，退场时不会被瞬间裁掉 */
+  transition: visibility 0s linear 0.45s;
   z-index: 1;
 }
 
 .layer.active {
-  opacity: 1;
+  visibility: visible;
   pointer-events: auto;
+  transition-delay: 0s;
   z-index: 5;
 }
 
@@ -235,43 +365,31 @@ body {
   padding: 0;
 }
 
-.layer-lobby.active {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-/* 主导航栏：从左侧滑入 */
+/* 主导航栏：从左侧滑入（用过渡而非 keyframes，退场时才能反向淡出） */
 .lobby-sidebar {
   width: var(--sidebar-w);
   flex-shrink: 0;
   height: 100%;
-  background: rgba(255, 255, 255, 0.22);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border-right: 1px solid rgba(255, 255, 255, 0.15);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 16px 0;
   transform: translateX(-100%);
   opacity: 0;
+  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 0.4s var(--ease-out);
   z-index: 5;
   position: relative;
 }
 
 .layer-lobby.active .lobby-sidebar {
-  animation: slideInSidebar 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-}
-
-@keyframes slideInSidebar {
-  from {
-    transform: translateX(-100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateX(0);
-    opacity: 1;
-  }
+  transform: translateX(0);
+  opacity: 1;
 }
 
 .sidebar-icons {
@@ -289,7 +407,7 @@ body {
   border: none;
   background: transparent;
   padding: 0;
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -317,7 +435,7 @@ body {
 }
 
 .sidebar-icon.active:hover {
-  background: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 255, 255, 0.32);
 }
 
 .lobby-main {
@@ -329,6 +447,20 @@ body {
 .layer-login {
   flex-direction: column;
   gap: 24px;
+  /* 内容整体落在中部靠上的位置 */
+  padding-bottom: 12vh;
+}
+
+/* 登录层退场/进场由子元素各自淡入淡出（原因见 .layer 上方说明） */
+.layer-login .login-hint,
+.layer-login .login-card {
+  opacity: 0;
+  transition: opacity 0.3s var(--ease-out);
+}
+
+.layer-login.active .login-hint,
+.layer-login.active .login-card {
+  opacity: 1;
 }
 
 .login-hint {
@@ -340,41 +472,134 @@ body {
   user-select: none;
 }
 
+/* 返回按钮：只有从大厅再次进入登录界面时才有得返回，平时隐藏 */
+.login-back {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  height: 32px;
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  /* 跟登录层其它元素一样随图层淡入淡出 */
+  opacity: 0;
+  transition: opacity 0.3s var(--ease-out), background 0.2s, color 0.2s, transform 0.15s;
+}
+
+.layer-login.active .login-back {
+  opacity: 1;
+}
+
+.login-back:hover {
+  background: rgba(255, 255, 255, 0.16);
+  color: var(--text-strong);
+}
+
+.login-back:active {
+  transform: scale(0.97);
+}
+
+.login-back[hidden] {
+  display: none;
+}
+
 .login-card {
-  width: 360px;
+  width: 380px;
   max-width: 85%;
-  padding: 32px 28px;
-  background: rgba(255, 255, 255, 0.2);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 20px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  padding: 24px 28px 30px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 20px;
+  gap: 22px;
+}
+
+/* ---- 登录方式横向导航栏 ---- */
+.login-tabs {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-pill);
+}
+
+.login-tab {
+  flex: 1;
+  height: 34px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-pill);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, transform 0.15s;
+}
+
+.login-tab:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-strong);
+}
+
+.login-tab:active {
+  transform: scale(0.97);
+}
+
+.login-tab.active {
+  background: var(--surface);
+  color: var(--text-strong);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+}
+
+/* ---- 角色图片 ---- */
+.login-avatar-wrap {
+  width: 168px;
+  height: 168px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .login-avatar {
-  width: 72px;
-  height: 72px;
-  border-radius: 16px;
-  object-fit: cover;
-  background: rgba(255, 255, 255, 0.15);
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  /* MC 素材本身是像素图，放大后保持硬边 */
+  image-rendering: pixelated;
+  filter: drop-shadow(0 10px 20px rgba(0, 0, 0, 0.35));
 }
 
 .login-input-group {
   width: 100%;
 }
 
+.login-input-group.hidden {
+  display: none;
+}
+
 .login-input {
   width: 100%;
   height: 44px;
   padding: 0 16px;
-  background: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.4);
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   font-size: 15px;
   color: #fff;
   outline: none;
@@ -389,22 +614,153 @@ body {
   border-color: rgba(255, 255, 255, 0.9);
 }
 
+/* ---- 三方登录（外置登录）：服务器地址 / 用户名 / 密码 ---- */
+.login-thirdparty {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.login-thirdparty.hidden {
+  display: none;
+}
+
+.login-tp-status {
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.85);
+  text-align: center;
+}
+
+.login-tp-status[hidden] {
+  display: none;
+}
+
+.login-tp-status.error {
+  color: #fca5a5;
+}
+
+/* 服务端下发多个角色时的选择列表 */
+.login-tp-profiles {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.login-tp-profiles[hidden] {
+  display: none;
+}
+
+.login-tp-profile {
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.login-tp-profile:hover {
+  background: rgba(255, 255, 255, 0.26);
+}
+
+/* ---- 正版登录：设备代码与进度 ---- */
+.login-msa {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.login-msa.hidden {
+  display: none;
+}
+
+.login-msa-code {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 20px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-2xl);
+  user-select: text;
+  cursor: text;
+}
+
+/* display:flex 会盖掉 UA 的 [hidden] 规则，需要显式补一条 */
+.login-msa-code[hidden] {
+  display: none;
+}
+
+.login-msa-code-label {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.login-msa-code-value {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: var(--text-strong);
+}
+
+/* 固定两行高度，等待过程中卡片不会跟着文案跳动 */
+.login-msa-status {
+  min-height: 34px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.login-msa-status.error {
+  color: #fca5a5;
+}
+
+.login-msa-link {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.login-msa-link[hidden] {
+  display: none;
+}
+
+.login-msa-link:hover {
+  color: var(--text-strong);
+}
+
 .login-btn {
   width: 100%;
   height: 44px;
-  background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+  background: linear-gradient(135deg, #00D4FF 0%, #00A8CC 100%);
   border: none;
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   font-size: 15px;
   font-weight: 700;
   color: #fff;
   cursor: pointer;
-  box-shadow: 0 4px 15px rgba(34, 197, 94, 0.4);
+  box-shadow: 0 4px 12px rgba(0, 212, 255, 0.22);
   transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
 }
 
 .login-btn:hover {
-  box-shadow: 0 6px 20px rgba(34, 197, 94, 0.5);
+  box-shadow: 0 6px 16px rgba(0, 212, 255, 0.3);
   transform: scale(1.02);
 }
 
@@ -439,12 +795,16 @@ body {
 /* ---- 自定义悬浮框 ---- */
 .custom-tooltip {
   position: fixed;
+  /* 位置全靠 transform 走（见 moveTooltip）：left/top 固定为原点，
+     鼠标移动时不再触发布局，只走合成层 */
+  left: 0;
+  top: 0;
   padding: 5px 10px;
   background: rgba(30, 41, 59, 0.72);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
   font-weight: 500;
   color: rgba(255, 255, 255, 0.85);
@@ -468,11 +828,12 @@ body {
   right: 30px;
   bottom: 30px;
   width: 200px;
-  background: rgba(255, 255, 255, 0.2);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 14px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
   z-index: 20;
   display: flex;
   flex-direction: column;
@@ -495,9 +856,10 @@ body {
   opacity: 0;
 }
 
+/* 同 .version-card：72px 头部 + 180px 列表，上限要留出边框，否则列表底部被切 */
 .account-card:hover,
 .account-card.expanded {
-  max-height: 250px;
+  max-height: 264px;
 }
 
 /* ---- 展开区域（在main上方） ---- */
@@ -532,12 +894,40 @@ body {
   width: 100%;
 }
 
+/* 头像槽：未登录时显示画出来的问号，已登录时显示角色头像 */
 .account-card-avatar {
   width: 44px;
   height: 44px;
-  border-radius: 10px;
-  object-fit: cover;
+  flex-shrink: 0;
+  border-radius: var(--radius-lg);
   border: 2px solid rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.avatar-unknown {
+  width: 22px;
+  height: 22px;
+}
+
+.account-card-avatar .avatar-image {
+  display: none;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  image-rendering: pixelated;
+}
+
+.account-card-avatar.has-avatar .avatar-image {
+  display: block;
+}
+
+.account-card-avatar.has-avatar .avatar-unknown {
+  display: none;
 }
 
 .account-card-name {
@@ -553,11 +943,12 @@ body {
 .account-manage-btn {
   width: 100%;
   padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.15);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 8px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
   font-size: 13px;
   font-weight: 600;
   color: #fff;
@@ -590,7 +981,7 @@ body {
   gap: 10px;
   padding: 10px 12px;
   background: rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   transition: background 0.15s;
 }
@@ -606,7 +997,7 @@ body {
 .account-list-item-avatar {
   width: 28px;
   height: 28px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   object-fit: cover;
 }
 
@@ -632,11 +1023,12 @@ body {
   left: calc(var(--sidebar-w) + 30px);
   bottom: 100px;
   width: 200px;
-  background: rgba(255, 255, 255, 0.2);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 14px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
   z-index: 20;
   display: flex;
   flex-direction: column;
@@ -659,9 +1051,10 @@ body {
   opacity: 0;
 }
 
-.version-card:hover,
-.version-card.expanded {
-  max-height: 250px;
+/* 展开上限要给够：72px 头部 + 180px 列表 + 上下边框，写 250px 会把列表底部切掉几像素。
+   `.version-card.expanded` 这个状态类从来没有被 JS 设置过，只有 :hover 生效，已移除。 */
+.version-card:hover {
+  max-height: 264px;
 }
 
 /* ---- 展开区域（在main上方） ---- */
@@ -672,8 +1065,7 @@ body {
   transition: max-height 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
 
-.version-card:hover .version-card-expand,
-.version-card.expanded .version-card-expand {
+.version-card:hover .version-card-expand {
   max-height: 180px;
   overflow-y: auto;
 }
@@ -699,7 +1091,7 @@ body {
 .version-card-icon {
   width: 44px;
   height: 44px;
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   object-fit: cover;
   border: 2px solid rgba(255, 255, 255, 0.4);
 }
@@ -729,7 +1121,7 @@ body {
   gap: 10px;
   padding: 10px 12px;
   background: rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   transition: background 0.15s;
 }
@@ -745,7 +1137,7 @@ body {
 .version-list-item-icon {
   width: 28px;
   height: 28px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   object-fit: cover;
 }
 
@@ -763,6 +1155,7 @@ body {
   color: rgba(255, 255, 255, 0.6);
   text-align: center;
   padding: 10px;
+  line-height: 1.7;
 }
 
 /* ---- 开始游戏按钮 ---- */
@@ -772,15 +1165,15 @@ body {
   bottom: 30px;
   width: 200px;
   height: 50px;
-  background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+  background: linear-gradient(135deg, #00D4FF 0%, #00A8CC 100%);
   border: none;
-  border-radius: 14px;
+  border-radius: var(--radius-2xl);
   font-size: 16px;
   font-weight: 700;
   color: #fff;
   cursor: pointer;
   z-index: 20;
-  box-shadow: 0 4px 15px rgba(34, 197, 94, 0.4);
+  box-shadow: 0 4px 12px rgba(0, 212, 255, 0.22);
   transition: transform 0.35s var(--ease-out),
               opacity 0.35s var(--ease-out),
               box-shadow 0.15s var(--ease-out);
@@ -800,13 +1193,13 @@ body {
 
 .start-game-btn:hover {
   transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(34, 197, 94, 0.5);
+  box-shadow: 0 6px 16px rgba(0, 212, 255, 0.3);
   transition: transform 0.15s var(--ease-out), box-shadow 0.15s var(--ease-out);
 }
 
 .start-game-btn:active {
   transform: translateY(1px);
-  box-shadow: 0 2px 10px rgba(34, 197, 94, 0.3);
+  box-shadow: 0 2px 8px rgba(0, 212, 255, 0.16);
   transition: transform 0.1s var(--ease-out), box-shadow 0.1s var(--ease-out);
 }
 
@@ -818,6 +1211,8 @@ body {
 }
 
 /* ---- 主页和下载页容器 ---- */
+/* 容器只负责定位与命中测试，不做 opacity 过渡：它们是内部毛玻璃的祖先，
+   透明度一旦小于 1 就会切断玻璃的背景模糊（见 .layer 上方说明）。 */
 .home-page,
 .download-page {
   position: fixed;
@@ -825,18 +1220,11 @@ body {
   left: var(--sidebar-w);
   right: 0;
   bottom: 0;
-  transition: opacity 0.3s var(--ease-out);
-  opacity: 0;
   pointer-events: none;
 }
 
-.home-page.active {
-  opacity: 1;
-  pointer-events: auto;
-}
-
+.home-page.active,
 .download-page.active {
-  opacity: 1;
   pointer-events: auto;
 }
 
@@ -847,35 +1235,42 @@ body {
   top: 0;
   bottom: 0;
   width: var(--subsidebar-w);
-  background: rgba(255, 255, 255, 0.15);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border-right: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 16px 0;
   gap: 8px;
   transform: translateX(-100%);
-  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+  opacity: 0;
+  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 0.25s var(--ease-out);
   z-index: 10;
 }
 
 /* 副导航栏滑入 */
 .sub-sidebar.slide-in {
   transform: translateX(0);
+  opacity: 1;
 }
 
-/* 副导航栏滑出（向左滑动，在主导航栏交界处消失） */
+/* 副导航栏滑出（向左滑动，在主导航栏交界处淡出消失） */
 .sub-sidebar.slide-out {
   transform: translateX(-100%);
+  opacity: 0;
 }
 
 /* 保持默认隐藏状态（页面未激活时） */
 .download-page .sub-sidebar:not(.slide-in),
 .settings-page .sub-sidebar:not(.slide-in),
-.resource-page .sub-sidebar:not(.slide-in) {
+.resource-page .sub-sidebar:not(.slide-in),
+.online-page .sub-sidebar:not(.slide-in) {
   transform: translateX(-100%);
+  opacity: 0;
 }
 
 .sub-sidebar-item {
@@ -889,7 +1284,7 @@ body {
   border: none;
   background: transparent;
   padding: 10px 5px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   color: rgba(255, 255, 255, 0.85);
   transition: background 0.2s, color 0.2s;
@@ -918,19 +1313,22 @@ body {
   color: var(--text);
 }
 
-/* ---- 下载页主内容区 ---- */
-.download-content {
+/* ---- 内容展示区（下载 / 设置 / 资源管理页）：三页共用同一套毛玻璃 ---- */
+.download-content,
+.settings-content,
+.resource-content,
+.online-content {
   position: absolute;
   left: calc(var(--subsidebar-w) + 8px);
   top: 12px;
   right: 12px;
   bottom: 12px;
-  background: rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 16px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
   overflow-y: auto;
   z-index: 1;
   opacity: 0;
@@ -939,6 +1337,32 @@ body {
 
 .download-page.active .download-content {
   opacity: 1;
+}
+
+/* ---- 子视图换内容的入场 ----
+   各 load* 函数都是 innerHTML = '' 再重建，面板自身只按页面 .active 过渡透明度，
+   所以「下载分类 / 设置分类 / 联机子页 / 详情↔列表」之间的切换原本是硬切。
+   面板挂 .stagger-in 后，新插入的直接子元素会自己播一遍淡入上移（新元素天然从头
+   播动画，不需要 JS 重新挂类）；nth-child 让多个分块轻微错峰。
+   只作用于直接子元素，避免和面板自身的 opacity 过渡互相覆盖。 */
+@keyframes reveal-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+.stagger-in > * {
+  animation: reveal-in 0.24s var(--ease-out) backwards;
+}
+
+.stagger-in > *:nth-child(2) { animation-delay: 0.05s; }
+.stagger-in > *:nth-child(3) { animation-delay: 0.1s; }
+.stagger-in > *:nth-child(4) { animation-delay: 0.15s; }
+
+/* display / [hidden] 展开回来的入场：元素本身没换，靠 JS 重新挂类触发 */
+.is-revealing {
+  animation: reveal-in 0.2s var(--ease-out);
 }
 
 .download-loading {
@@ -953,7 +1377,7 @@ body {
 .download-spinner {
   width: 32px;
   height: 32px;
-  border: 3px solid rgba(255, 255, 255, 0.2);
+  border: 3px solid rgba(255, 255, 255, 0.22);
   border-top-color: rgba(255, 255, 255, 0.7);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
@@ -965,7 +1389,7 @@ body {
 
 .download-loading p {
   font-size: 14px;
-  color: rgba(255, 255, 255, 0.9);
+  color: var(--text-muted);
 }
 
 /* ---- 版本组列表 ---- */
@@ -978,7 +1402,7 @@ body {
 
 /* ---- 可展开栏 ---- */
 .version-section {
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   overflow: hidden;
   /* 折叠头是 button，默认按内容收缩宽度；用列向flex让子项撑满整个展示区 */
   display: flex;
@@ -990,7 +1414,8 @@ body {
   align-items: center;
   gap: 8px;
   padding: 10px 14px;
-  background: rgba(255, 255, 255, 0.45);
+  background: var(--glass-row);
+  border-bottom: 1px solid var(--glass-row-border);
   cursor: pointer;
   user-select: none;
   transition: background 0.2s;
@@ -999,12 +1424,12 @@ body {
 }
 
 .version-section-header:hover {
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--glass-row-hover);
 }
 
 .version-section-arrow {
   font-size: 10px;
-  color: #64748b;
+  color: var(--text-muted);
   transition: transform 0.25s ease;
 }
 
@@ -1015,22 +1440,22 @@ body {
 .version-section-title {
   font-size: 14px;
   font-weight: 600;
-  color: #1e293b;
+  color: var(--text-strong);
   flex: 1;
 }
 
 .version-section-count {
   font-size: 12px;
   font-weight: 500;
-  color: #64748b;
-  background: rgba(255, 255, 255, 0.5);
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.18);
   padding: 1px 8px;
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
 }
 
 .version-section-body {
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.05);
   display: none;
 }
 
@@ -1047,17 +1472,17 @@ body {
   justify-content: space-between;
   padding: 10px 14px;
   margin: 4px 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   transition: background 0.15s;
 }
 
 .version-item:hover {
-  background: rgba(255, 255, 255, 0.4);
+  background: var(--glass-row-hover);
 }
 
 .version-item.selected {
-  background: rgba(34, 197, 94, 0.3);
+  background: rgba(0, 212, 255, 0.3);
 }
 
 .version-item-info {
@@ -1069,24 +1494,24 @@ body {
 .version-id {
   font-size: 13px;
   font-weight: 600;
-  color: #1a1a1a;
+  color: var(--text-strong);
 }
 
 .version-date {
   font-size: 11px;
-  color: #64748b;
+  color: var(--text-muted);
 }
 
 .version-type {
   font-size: 11px;
   font-weight: 500;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 
-.version-type-release { background: #d1fae5; color: #065f46; }
-.version-type-snapshot { background: #dbeafe; color: #1e40af; }
-.version-type-old_beta, .version-type-old_alpha { background: #fef3c7; color: #92400e; }
+.version-type-release { background: rgba(52, 211, 153, 0.22); color: #a7f3d0; }
+.version-type-snapshot { background: rgba(96, 165, 250, 0.22); color: #bfdbfe; }
+.version-type-old_beta, .version-type-old_alpha { background: rgba(251, 191, 36, 0.22); color: #fde68a; }
 
 /* ---- 下载信息页 ---- */
 .download-info-page {
@@ -1104,16 +1529,16 @@ body {
 
 .download-info-back {
   font-size: 14px;
-  color: #fff;
+  color: var(--text);
   cursor: pointer;
   padding: 4px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   transition: background 0.15s;
   user-select: none;
 }
 
 .download-info-back:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--glass-row-hover);
 }
 
 .download-info-row {
@@ -1125,18 +1550,18 @@ body {
 .download-info-label {
   font-size: 13px;
   font-weight: 600;
-  color: #fff;
+  color: var(--text);
 }
 
 .download-info-input {
   width: 100%;
   height: 40px;
   padding: 0 14px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 2px solid rgba(255, 255, 255, 0.3);
-  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 2px solid rgba(255, 255, 255, 0.24);
+  border-radius: var(--radius-lg);
   font-size: 14px;
-  color: #1a1a1a;
+  color: var(--text-strong);
   outline: none;
   transition: border-color 0.2s;
 }
@@ -1155,32 +1580,33 @@ body {
   display: flex;
   align-items: center;
   padding: 10px 14px;
-  background: rgba(255, 255, 255, 0.4);
-  border-radius: 8px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-md);
   cursor: pointer;
   transition: background 0.15s;
 }
 
 .download-info-option:hover {
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--glass-row-hover);
 }
 
 .download-info-option-label {
   font-size: 13px;
   font-weight: 600;
-  color: #1e293b;
+  color: var(--text-strong);
   flex: 1;
 }
 
 .download-info-option-value {
   font-size: 13px;
-  color: #64748b;
+  color: var(--text-muted);
   margin-right: 8px;
 }
 
 .download-info-option-arrow {
   font-size: 10px;
-  color: #94a3b8;
+  color: var(--text-faint);
 }
 
 .download-info-btn-row {
@@ -1191,9 +1617,9 @@ body {
 .download-info-start-btn {
   width: 100%;
   height: 42px;
-  background: #22c55e;
+  background: #00D4FF;
   border: none;
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   font-size: 15px;
   font-weight: 600;
   color: #fff;
@@ -1202,7 +1628,7 @@ body {
 }
 
 .download-info-start-btn:hover {
-  background: #16a34a;
+  background: #00A8CC;
   transform: scale(1.01);
 }
 
@@ -1230,16 +1656,16 @@ body {
 .download-progress-bar {
   width: 100%;
   height: 8px;
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius-xs);
   overflow: hidden;
 }
 
 .download-progress-fill {
   height: 100%;
   width: 100%;
-  background: linear-gradient(90deg, #22c55e, #4ade80);
-  border-radius: 4px;
+  background: linear-gradient(90deg, #00D4FF, #5CDBFF);
+  border-radius: var(--radius-xs);
   transform: scaleX(0);
   transform-origin: left;
   transition: transform 0.3s var(--ease-out);
@@ -1253,13 +1679,13 @@ body {
 
 .download-progress-text {
   font-size: 12px;
-  color: #64748b;
+  color: var(--text-muted);
 }
 
 .download-progress-percent {
   font-size: 13px;
   font-weight: 600;
-  color: #22c55e;
+  color: #5CDBFF;
 }
 
 /* ---- 失败文件列表 ---- */
@@ -1269,14 +1695,14 @@ body {
   gap: 6px;
   padding: 12px;
   background: rgba(239, 68, 68, 0.1);
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   margin-top: 8px;
 }
 
 .download-failed-title {
   font-size: 13px;
   font-weight: 600;
-  color: #dc2626;
+  color: #fca5a5;
   margin-bottom: 4px;
 }
 
@@ -1285,14 +1711,15 @@ body {
   flex-direction: column;
   gap: 2px;
   padding: 8px 10px;
-  background: rgba(255, 255, 255, 0.5);
-  border-radius: 6px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-sm);
 }
 
 .download-failed-name {
   font-size: 12px;
   font-weight: 500;
-  color: #1a1a1a;
+  color: var(--text-strong);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1300,7 +1727,7 @@ body {
 
 .download-failed-error {
   font-size: 11px;
-  color: #dc2626;
+  color: #fca5a5;
 }
 
 .download-retry-btn {
@@ -1308,7 +1735,7 @@ body {
   padding: 10px 16px;
   background: #ef4444;
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 600;
   color: #fff;
@@ -1327,32 +1754,11 @@ body {
   left: var(--sidebar-w);
   right: 0;
   bottom: 0;
-  transition: opacity 0.3s var(--ease-out);
-  opacity: 0;
   pointer-events: none;
 }
 
 .settings-page.active {
-  opacity: 1;
   pointer-events: auto;
-}
-
-.settings-content {
-  position: absolute;
-  left: calc(var(--subsidebar-w) + 8px);
-  top: 12px;
-  right: 12px;
-  bottom: 12px;
-  background: rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 16px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
-  overflow-y: auto;
-  z-index: 1;
-  opacity: 0;
-  transition: opacity 0.3s var(--ease-out);
 }
 
 .settings-page.active .settings-content {
@@ -1367,7 +1773,7 @@ body {
 .settings-section-title {
   font-size: 12px;
   font-weight: 600;
-  color: rgba(255, 255, 255, 0.85);
+  color: var(--text);
   letter-spacing: 1px;
   margin-bottom: 8px;
   padding: 0 4px;
@@ -1378,19 +1784,20 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.4);
-  border-radius: 10px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
   margin-bottom: 6px;
   cursor: pointer;
   transition: background 0.15s;
 }
 
 .settings-item:hover {
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--glass-row-hover);
 }
 
 .settings-item.is-selected {
-  background: rgba(34, 197, 94, 0.3);
+  background: rgba(0, 212, 255, 0.3);
 }
 
 .settings-item.is-danger {
@@ -1399,56 +1806,105 @@ body {
 }
 
 .settings-item.is-danger .settings-item-label {
-  color: #dc2626;
+  color: #fca5a5;
 }
 
 .settings-item-label {
   font-size: 14px;
   font-weight: 500;
-  color: #1e293b;
+  color: var(--text-strong);
 }
 
 .settings-item-value {
   font-size: 13px;
-  color: #64748b;
+  color: var(--text-muted);
 }
 
 .settings-item-arrow {
   font-size: 10px;
-  color: #94a3b8;
+  color: var(--text-muted);
 }
 
-/* ---- 版本展开列表 ---- */
-.settings-version-expand {
-  max-height: 0;
+/* ---- 已下载版本：右侧的版本设置与图钉固定 ---- */
+/* 行主体只是信息，整行不可点；可点区域只有右侧两个图标按钮 */
+.version-manage-row {
+  cursor: default;
+  gap: 10px;
+}
+
+.version-manage-info {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;                  /* 不写这条 flex 项不会收缩，省略号不生效 */
+}
+
+.version-manage-info .settings-item-label {
   overflow: hidden;
-  transition: max-height 0.3s ease;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.settings-version-expand.open {
-  max-height: 200px;
-  overflow-y: auto;
+.version-manage-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
-.settings-version-expand-item {
-  padding: 6px 12px 6px 32px;
-  font-size: 13px;
-  font-weight: 500;
-  color: #334155;
-  cursor: pointer;
-  border-radius: 6px;
-  margin: 2px 8px;
-  transition: background 0.15s;
-}
-
-.settings-version-expand-item:hover {
-  background: rgba(34, 197, 94, 0.2);
-}
-
-.settings-version-expand-empty {
-  padding: 6px 12px 6px 32px;
+/* 行内的「启动游戏」：缩小的主页启动按钮，主色 */
+.version-manage-launch {
+  flex-shrink: 0;
+  padding: 6px 12px;
   font-size: 12px;
-  color: #94a3b8;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(135deg, #00D4FF 0%, #00A8CC 100%);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: box-shadow 0.15s, opacity 0.15s;
+}
+
+.version-manage-launch:hover:not(:disabled) {
+  box-shadow: 0 3px 8px rgba(0, 212, 255, 0.25);
+}
+
+.version-manage-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.version-manage-btn:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.version-manage-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* 已固定到主页：图钉点亮成主色 */
+.version-manage-pin.is-pinned {
+  color: #fff;
+  background: rgba(0, 212, 255, 0.55);
+  border-color: rgba(0, 212, 255, 0.85);
+}
+
+.version-manage-pin.is-pinned:hover {
+  background: rgba(0, 212, 255, 0.78);
 }
 
 /* ---- 资源管理页容器 ---- */
@@ -1458,36 +1914,253 @@ body {
   left: var(--sidebar-w);
   right: 0;
   bottom: 0;
-  transition: opacity 0.3s var(--ease-out);
-  opacity: 0;
   pointer-events: none;
 }
 
 .resource-page.active {
-  opacity: 1;
   pointer-events: auto;
-}
-
-.resource-content {
-  position: absolute;
-  left: calc(var(--subsidebar-w) + 8px);
-  top: 12px;
-  right: 12px;
-  bottom: 12px;
-  background: rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 16px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
-  overflow-y: auto;
-  z-index: 1;
-  opacity: 0;
-  transition: opacity 0.3s var(--ease-out);
 }
 
 .resource-page.active .resource-content {
   opacity: 1;
+}
+
+/* ---- 联机页容器 ---- */
+.online-page {
+  position: fixed;
+  top: 32px;
+  left: var(--sidebar-w);
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+}
+
+.online-page.active {
+  pointer-events: auto;
+}
+
+.online-page.active .online-content {
+  opacity: 1;
+}
+
+/* 联机页底部常驻的服务归属提示：内容面板让出底部一条，避免压住它 */
+.online-page .online-content {
+  bottom: 44px;
+}
+
+.online-attribution {
+  position: absolute;
+  left: calc(var(--subsidebar-w) + 8px);
+  right: 12px;
+  bottom: 12px;
+  padding: 4px 0;
+  border: none;
+  background: none;
+  font-size: 12px;
+  color: var(--text-faint);
+  text-align: center;
+  cursor: pointer;
+  /* 只在联机页显示：容器非激活时只关了 pointer-events，文字本身照样会画出来，
+     会压在主页/下载页/资源页的面板上，所以这里必须自己管显隐 */
+  opacity: 0;
+  visibility: hidden;
+  /* 退场时等淡出走完再 hidden，和 .layer 同一套写法 */
+  transition: color 0.2s var(--ease-out),
+              opacity 0.3s var(--ease-out),
+              visibility 0s linear 0.3s;
+}
+
+.online-page.active .online-attribution {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+.online-attribution:hover {
+  color: var(--text-muted);
+}
+
+/* ---- 联机页：按钮 / 输入框 / 提示 / 状态 / 日志 ----
+   联机页的控件由 JS 动态建（onlineButton / online-input），外观统一收在这里：
+   内联 cssText 写不出伪类，hover / active / focus 的过渡会整体缺失。 */
+.online-btn {
+  padding: 8px 16px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: #fff;
+  cursor: pointer;
+  transition: background-color 0.2s var(--ease-out),
+              border-color 0.2s var(--ease-out),
+              transform 0.12s var(--ease-out);
+}
+
+.online-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.online-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.online-btn:disabled {
+  transform: none;
+}
+
+.online-btn.is-primary {
+  background-color: var(--accent);
+}
+
+.online-btn.is-primary:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+}
+
+.online-btn.is-danger {
+  background-color: rgba(239, 68, 68, 0.85);
+}
+
+.online-btn.is-danger:hover:not(:disabled) {
+  background-color: rgba(239, 68, 68, 1);
+}
+
+.online-btn.is-ghost {
+  background-color: rgba(255, 255, 255, 0.18);
+  border-color: var(--glass-row-border);
+}
+
+.online-btn.is-ghost:hover:not(:disabled) {
+  background-color: rgba(255, 255, 255, 0.28);
+}
+
+.online-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  outline: none;
+  transition: border-color 0.2s var(--ease-out), background 0.2s var(--ease-out);
+}
+
+.online-input::placeholder {
+  color: var(--text-faint);
+}
+
+.online-input:focus {
+  border-color: rgba(0, 212, 255, 0.75);
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.online-input.is-port {
+  max-width: 120px;
+}
+
+/* 隧道 / 节点列表行：左列自适应宽度，右列固定不缩，避免长主机名把按钮挤飞 */
+.online-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.online-row-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.online-row-side {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+  align-items: center;
+}
+
+.online-row-state {
+  font-size: 13px;
+  color: #7FE3FF;
+}
+
+.online-row-state.is-off {
+  color: #fca5a5;
+}
+
+.online-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  padding: 2px 4px 8px;
+}
+
+.online-empty {
+  padding: 24px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.online-status-pill {
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--glass-row-border);
+  /* 连接 / 断开是状态切换，颜色要过渡而不是瞬间跳变 */
+  transition: background 0.25s var(--ease-out),
+              color 0.25s var(--ease-out),
+              border-color 0.25s var(--ease-out);
+}
+
+.online-status-pill.is-on {
+  color: #B3EEFF;
+  background: rgba(0, 212, 255, 0.22);
+  border-color: rgba(0, 212, 255, 0.45);
+}
+
+.online-tag {
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.online-tag.is-off {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.18);
+}
+
+/* frpc 的输出原样展示，等宽字体 + 深色底方便读连接过程 */
+.online-log {
+  height: 200px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: var(--radius-xl);
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--glass-row-border);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.online-log-line {
+  color: rgba(255, 255, 255, 0.82);
+  white-space: pre-wrap;
+  word-break: break-all;
+  /* 新行插入时淡入，避免 frpc 日志一条条硬蹦出来 */
+  animation: log-in 0.18s var(--ease-out);
+}
+
+@keyframes log-in {
+  from {
+    opacity: 0;
+  }
 }
 
 /* ---- 滑动条 ---- */
@@ -1496,8 +2169,9 @@ body {
   flex-direction: column;
   gap: 6px;
   padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.4);
-  border-radius: 10px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
   margin-bottom: 6px;
 }
 
@@ -1510,13 +2184,13 @@ body {
 .slider-row-label {
   font-size: 14px;
   font-weight: 500;
-  color: #1e293b;
+  color: var(--text-strong);
 }
 
 .slider-row-value {
   font-size: 13px;
   font-weight: 600;
-  color: #3b82f6;
+  color: #93c5fd;
   min-width: 50px;
   text-align: right;
 }
@@ -1526,8 +2200,8 @@ body {
   appearance: none;
   width: 100%;
   height: 6px;
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius-xs);
   outline: none;
   cursor: pointer;
 }
@@ -1561,7 +2235,7 @@ body {
 
 .slider-warning {
   font-size: 11px;
-  color: #ef4444;
+  color: #fca5a5;
   font-weight: 500;
   margin-top: 2px;
 }
@@ -1572,31 +2246,81 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.4);
-  border-radius: 10px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
   margin-bottom: 6px;
   cursor: pointer;
+  /* 与同族的 .settings-item / .version-item 对齐：hover 也要有过渡 */
+  transition: background 0.15s;
 }
 
 .select-row:hover {
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--glass-row-hover);
 }
 
 .select-row-label {
   font-size: 14px;
   font-weight: 500;
-  color: #1e293b;
+  color: var(--text-strong);
 }
 
-.select-row select {
-  padding: 4px 8px;
-  border: 1px solid rgba(0, 0, 0, 0.1);
-  border-radius: 6px;
-  font-size: 13px;
-  background: rgba(255, 255, 255, 0.5);
-  color: #1e293b;
-  outline: none;
+/* 下拉外壳的宽度：下载设置里保持紧凑，Java 栏单独放宽以容纳完整路径 */
+.select-row .dropdown {
+  max-width: 240px;
+}
+
+.select-row .dropdown:has(.java-select) {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 520px;
+}
+
+/* 下拉 + 小按钮（如 Java 栏的刷新） */
+.select-row-controls {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.select-row-btn {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  color: var(--text);
   cursor: pointer;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.select-row-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.select-row-btn:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+  color: var(--text-strong);
+}
+
+.select-row-btn:disabled {
+  cursor: default;
+}
+
+.select-row-btn.spinning svg {
+  animation: spin 0.8s linear infinite;
 }
 
 /* ---- Mod浏览器 ---- */
@@ -1610,6 +2334,9 @@ body {
 
 .mod-search-bar {
   display: grid;
+  /* 第一列是 1fr：固定列变宽 → 输入框变窄 → 后面的列整体左移，反之右移。
+     这一行右端会被通知卡片（fixed, top:44 right:20, 宽 220）盖住，
+     调列宽或改通知位置时都要一起看，否则「功能分类」会落到卡片底下点不动。 */
   grid-template-columns: 1fr 120px 110px 120px auto auto;
   gap: 8px;
   align-items: center;
@@ -1620,17 +2347,17 @@ body {
   width: 100%;
   height: 36px;
   padding: 0 12px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 2px solid rgba(255, 255, 255, 0.3);
-  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 2px solid rgba(255, 255, 255, 0.24);
+  border-radius: var(--radius-md);
   font-size: 13px;
-  color: #1e293b;
+  color: var(--text-strong);
   outline: none;
   transition: border-color 0.2s;
 }
 
 .mod-search-input::placeholder {
-  color: #94a3b8;
+  color: var(--text-faint);
 }
 
 .mod-search-input:focus {
@@ -1639,16 +2366,11 @@ body {
 
 .mod-filter-select {
   width: 100%;
-  height: 36px;
-  padding: 0 10px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 2px solid rgba(255, 255, 255, 0.3);
-  border-radius: 8px;
-  font-size: 13px;
-  color: #1e293b;
-  outline: none;
-  cursor: pointer;
-  transition: border-color 0.2s;
+}
+
+/* 加载器版本下拉：约束最小宽度（作用在外壳上，select 已被外壳包住） */
+.download-info-option .dropdown:has(.modloader-version-select) {
+  min-width: 120px;
 }
 
 .mod-filter-select:focus {
@@ -1660,7 +2382,7 @@ body {
   padding: 0 16px;
   background: #3b82f6;
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 600;
   color: #fff;
@@ -1680,18 +2402,18 @@ body {
 .mod-reset-btn {
   height: 36px;
   padding: 0 14px;
-  background: rgba(255, 255, 255, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 8px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 500;
-  color: #64748b;
+  color: var(--text-muted);
   cursor: pointer;
   transition: background 0.2s;
 }
 
 .mod-reset-btn:hover {
-  background: rgba(255, 255, 255, 0.5);
+  background: var(--glass-row-hover);
 }
 
 /* ---- Mod结果列表 ---- */
@@ -1708,21 +2430,22 @@ body {
   display: flex;
   gap: 12px;
   padding: 12px;
-  background: rgba(255, 255, 255, 0.45);
-  border-radius: 10px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
   cursor: pointer;
   transition: background 0.15s, transform 0.1s;
 }
 
 .mod-card:hover {
-  background: rgba(255, 255, 255, 0.65);
+  background: var(--glass-row-hover);
   transform: translateY(-1px);
 }
 
 .mod-card-icon {
   width: 56px;
   height: 56px;
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   object-fit: cover;
   flex-shrink: 0;
   background: rgba(255, 255, 255, 0.3);
@@ -1746,10 +2469,18 @@ body {
 .mod-card-name {
   font-size: 14px;
   font-weight: 700;
-  color: #1e293b;
+  color: var(--text-strong);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 译名后面的原英文名，靠透明度降一级，不再用另一种色相 */
+.mod-name-en {
+  margin-left: 6px;
+  font-size: 0.85em;
+  font-weight: 500;
+  color: var(--text-muted);
 }
 
 .mod-card-categories {
@@ -1762,15 +2493,15 @@ body {
   font-size: 10px;
   font-weight: 600;
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   background: rgba(59, 130, 246, 0.15);
-  color: #3b82f6;
+  color: #93c5fd;
   white-space: nowrap;
 }
 
 .mod-card-desc {
   font-size: 12px;
-  color: #475569;
+  color: var(--text);
   line-height: 1.4;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -1787,7 +2518,7 @@ body {
 
 .mod-card-meta-item {
   font-size: 11px;
-  color: #64748b;
+  color: var(--text-muted);
   display: flex;
   align-items: center;
   gap: 3px;
@@ -1811,18 +2542,18 @@ body {
 
 .mod-loading p, .mod-empty p {
   font-size: 14px;
-  color: rgba(255, 255, 255, 0.9);
+  color: var(--text-muted);
 }
 
 .mod-load-more {
   width: 100%;
   padding: 10px;
-  background: rgba(255, 255, 255, 0.2);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 8px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 500;
-  color: #fff;
+  color: var(--text);
   cursor: pointer;
   transition: background 0.2s;
 }
@@ -1831,7 +2562,315 @@ body {
   background: rgba(255, 255, 255, 0.35);
 }
 
+/* ---- 卡片上的“打开网页”次要操作 ---- */
+.mod-card-web {
+  flex-shrink: 0;
+  align-self: center;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.mod-card-web:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+/* ---- 文件列表：选完版本再另存为 ---- */
+.mod-files {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+}
+
+.mod-files-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.mod-files-back {
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.mod-files-back:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.mod-files-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mod-files-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.mod-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ---- 版本详情里的 mod 列表与启停 ---- */
+.settings-item-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  padding: 6px 10px 10px;
+}
+
+.mod-toggle-row {
+  cursor: pointer;
+  gap: 10px;
+  /* 覆盖 .settings-item 的 space-between：状态+名字靠左，操作提示靠右 */
+  justify-content: flex-start;
+}
+
+.mod-toggle-row:hover {
+  background: var(--glass-row-hover);
+}
+
+/* 提高一级选择器权重，压过 .settings-item-label 的字号与颜色 */
+.mod-toggle-row .mod-toggle-name {
+  flex: 1;
+  min-width: 0;              /* 不写这条的话 flex 项不会收缩，省略号不生效 */
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mod-toggle-row .settings-item-value {
+  flex-shrink: 0;
+}
+
+.mod-toggle-state {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: var(--radius-xs);
+  /* 启用/停用切换时颜色要有过渡，和 .settings-item.is-selected 保持一致 */
+  transition: background 0.2s var(--ease-out), color 0.2s var(--ease-out);
+}
+
+.mod-toggle-state.is-on {
+  background: rgba(0, 212, 255, 0.2);
+  color: #7FE3FF;
+}
+
+.mod-toggle-state.is-off {
+  background: rgba(255, 255, 255, 0.16);
+  color: var(--text-muted);
+}
+
+/* ---- 按游戏版本索引：外层只列版本，点开展开文件 ---- */
+.mod-ver-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mod-ver-group {
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.mod-ver-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--glass-row);
+  border: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.mod-ver-head:hover {
+  background: var(--glass-row-hover);
+}
+
+.mod-ver-caret {
+  font-size: 10px;
+  color: var(--text-muted);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+
+.mod-ver-caret.is-open {
+  transform: rotate(90deg);
+}
+
+.mod-ver-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-strong);
+  flex-shrink: 0;
+}
+
+.mod-ver-current {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  background: rgba(0, 212, 255, 0.2);
+  color: #7FE3FF;
+  flex-shrink: 0;
+}
+
+.mod-ver-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.mod-ver-loaders {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mod-ver-files {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 10px 10px 26px;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+/* 作者样式里的 display:flex 会盖掉 [hidden] 的 UA 规则（display:none），
+   不显式写这条的话折叠状态完全不起作用 */
+.mod-ver-files[hidden] {
+  display: none;
+}
+
+/* 展开区里的文件行不再重复画边框，靠分组框包住 */
+.mod-ver-files .mod-file-row {
+  background: var(--glass-row);
+}
+
+.mod-file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
+}
+
+.mod-file-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.mod-file-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+  word-break: break-all;
+}
+
+.mod-file-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mod-file-badge {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.mod-file-badge-release {
+  background: rgba(0, 212, 255, 0.2);
+  color: #7FE3FF;
+}
+
+.mod-file-badge-beta {
+  background: rgba(234, 179, 8, 0.2);
+  color: #fde047;
+}
+
+.mod-file-badge-alpha {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+
+.mod-file-save {
+  flex-shrink: 0;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(59, 130, 246, 0.9);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.mod-file-save:hover {
+  background: rgba(59, 130, 246, 1);
+}
+
+.mod-file-save:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* 提高一级选择器权重，否则会被上面的 .mod-empty p 按优先级盖掉字号 */
+.mod-empty p.mod-empty-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  opacity: 0.8;
+}
+
 /* ===== 消息提示框 ===== */
+/* 通知层浮在各页控件上方，一旦参与命中测试，底下被盖住的控件
+   （下载页的「功能分类」下拉、搜索/重置按钮等）就点不动了。
+   所以容器和卡片本身都穿透，只有关闭按钮保留可点。
+   代价：卡片不能再接收点击（showNotification 的 onClick 回调因此失效，目前无人使用），
+   通知超出 max-height 时也无法拖动滚动条。 */
 .notification-container {
   position: fixed;
   top: 44px;
@@ -1844,28 +2883,20 @@ body {
   gap: 10px;
   overflow-y: auto;
   overflow-x: hidden;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
-}
-
-.notification-container::-webkit-scrollbar {
-  width: 6px;
-}
-
-.notification-container::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.3);
-  border-radius: 3px;
+  pointer-events: none;
 }
 
 /* 消息卡片 */
 .notification-card {
   width: 220px;
   min-height: 72px;
-  background: rgba(255, 255, 255, 0.2);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 14px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  pointer-events: none;
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
@@ -1912,7 +2943,7 @@ body {
 .notification-icon {
   width: 32px;
   height: 32px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   object-fit: cover;
   position: absolute;
   top: 14px;
@@ -1940,11 +2971,20 @@ body {
 
 /* 进度条颜色变体 */
 .notification-progress-bar.info {
-  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  background: linear-gradient(90deg, var(--info), var(--info-soft));
+}
+
+/* 下载进度条：按实际进度从左往右填。
+   倒计时条是靠 transform-origin: right 从右往左缩的，方向正好相反，得单独覆盖。 */
+.notification-progress-bar.downloading {
+  background: linear-gradient(90deg, var(--info), var(--info-soft));
+  transform-origin: left;
+  transform: scaleX(0);
+  transition: transform 0.3s var(--ease-out);
 }
 
 .notification-progress-bar.success {
-  background: linear-gradient(90deg, #22c55e, #4ade80);
+  background: linear-gradient(90deg, #00D4FF, #5CDBFF);
 }
 
 .notification-progress-bar.warning {
@@ -1955,7 +2995,7 @@ body {
   background: linear-gradient(90deg, #ef4444, #f87171);
 }
 
-/* 关闭按钮 */
+/* 关闭按钮：卡片整体已穿透，它是唯一需要接收点击的元素 */
 .notification-close {
   position: absolute;
   top: 8px;
@@ -1971,15 +3011,659 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  opacity: 0;
+  /* 卡片收不到 hover 了，不能再用 hover 显形，改为常显 */
+  pointer-events: auto;
+  opacity: 0.7;
   transition: opacity 0.2s, background 0.2s;
 }
 
-.notification-card:hover .notification-close {
+.notification-close:hover {
   opacity: 1;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
 }
 
-.notification-close:hover {
-  background: rgba(255, 255, 255, 0.4);
+/* ============================================================================
+   统一下压反馈
+   原本只有 6 个控件写了 :active，同类控件缺失会显得"有的按得动有的按不动"。
+   这里补齐交互控件，并把 transform 并进各自的过渡（它们原本过渡里没有 transform，
+   不补的话按下瞬间是硬跳）。
+   例外：.settings-item / .select-row 不列入 —— 这两类既当可点行也当纯信息行用，
+   纯信息行不该有按下反馈。
+   ============================================================================ */
+
+/* 过渡里只有 background 的那批 */
+.version-item,
+.version-list-item,
+.account-list-item,
+.download-info-option,
+.mod-ver-head,
+.mod-card,
+.mod-card-web,
+.mod-files-back,
+.mod-file-save,
+.mod-load-more,
+.mod-reset-btn,
+.download-info-back,
+.download-retry-btn,
+.version-section-header {
+  transition: background 0.15s, transform 0.12s var(--ease-out);
+}
+
+/* 过渡里本来还有别的属性：逐条保留，只追加 transform */
+.sub-sidebar-item {
+  transition: background 0.2s, color 0.2s, transform 0.12s var(--ease-out);
+}
+
+.version-manage-btn {
+  transition: background 0.15s, color 0.15s, transform 0.12s var(--ease-out);
+}
+
+.version-manage-launch {
+  transition: box-shadow 0.15s, opacity 0.15s, transform 0.12s var(--ease-out);
+}
+
+.select-row-btn {
+  transition: background-color 0.2s, color 0.2s, transform 0.12s var(--ease-out);
+}
+
+.notification-close {
+  transition: opacity 0.2s, background 0.2s, transform 0.12s var(--ease-out);
+}
+
+.dropdown-trigger {
+  transition: background 0.15s, transform 0.12s var(--ease-out);
+}
+
+/* 按下：统一下沉 1px */
+.version-item:active,
+.version-list-item:active,
+.account-list-item:active,
+.download-info-option:active,
+.mod-ver-head:active,
+.mod-card:active,
+.mod-card-web:active,
+.mod-files-back:active,
+.mod-file-save:active,
+.mod-load-more:active,
+.mod-reset-btn:active,
+.download-info-back:active,
+.download-retry-btn:active,
+.version-section-header:active,
+.sub-sidebar-item:active,
+.version-manage-btn:active,
+.version-manage-launch:active:not(:disabled),
+.select-row-btn:active:not(:disabled),
+.notification-close:active,
+.dropdown-trigger:active {
+  transform: translateY(1px);
+}
+
+/* 本来就是缩放式 hover 的两个：按下也走缩放，别混两套位移语言 */
+.sidebar-icon:active {
+  transform: scale(0.97);
+}
+
+.ctrl-btn:active {
+  transform: scale(0.95);
+}
+/* ============================================================================
+   整合包拖放安装
+   ============================================================================ */
+
+/* ---- 拖入时的全屏提示 ---- */
+/* 原生层接管了拖放，页面收不到任何 drag 事件，遮罩完全由 C++ 发来的
+   app.fileDragEnter / app.fileDragLeave 驱动。pointer-events:none 很关键：
+   鼠标这时候正在拖文件，遮罩要是吃掉事件，Drop 就落不到 WebView 上了 */
+.drop-overlay {
+  position: fixed;
+  inset: var(--topbar-h) 0 0 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: rgba(10, 14, 30, 0.55);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  animation: drop-overlay-in 0.16s var(--ease-out);
+}
+
+.drop-overlay[hidden] {
+  display: none;
+}
+
+@keyframes drop-overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.drop-overlay-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 40px 56px;
+  border: 2px dashed var(--accent);
+  border-radius: var(--glass-radius);
+  background: var(--glass-bg);
+  box-shadow: var(--glass-shadow);
+}
+
+.drop-overlay-arrow {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  position: relative;
+}
+
+/* 圈里的下箭头：用两条边拼一个 V，再配一根竖线 */
+.drop-overlay-arrow::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 11px;
+  width: 2px;
+  height: 20px;
+  margin-left: -1px;
+  background: var(--accent);
+}
+
+.drop-overlay-arrow::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 22px;
+  width: 14px;
+  height: 14px;
+  margin-left: -7px;
+  border-right: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
+  transform: rotate(45deg);
+}
+
+.drop-overlay-title {
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.drop-overlay-hint {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ---- 安装确认卡片 ---- */
+.modpack-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 380;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 14, 30, 0.5);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  animation: drop-overlay-in 0.16s var(--ease-out);
+}
+
+.modpack-mask[hidden] {
+  display: none;
+}
+
+.modpack-dialog {
+  width: 420px;
+  max-height: 82vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: rgba(24, 28, 48, 0.92);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  color: var(--text);
+}
+
+.modpack-dialog-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.modpack-badge {
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #06202b;
+  background: var(--accent);
+}
+
+.modpack-badge.is-cf {
+  background: var(--warn);
+  color: #2b1a02;
+}
+
+.modpack-name {
+  font-size: 13px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.modpack-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.modpack-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 9px 12px;
+  background: var(--glass-row);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+}
+
+.modpack-row-label {
+  color: var(--text-muted);
+}
+
+.modpack-row-value {
+  color: var(--text-strong);
+  font-weight: 600;
+  text-align: right;
+  word-break: break-all;
+}
+
+.modpack-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.modpack-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.modpack-field-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.modpack-checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.modpack-checkbox input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.modpack-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.modpack-btn {
+  flex: 1;
+  height: 40px;
+  border: none;
+  border-radius: var(--radius-xl);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s;
+}
+
+.modpack-btn.is-primary {
+  background: var(--accent);
   color: #fff;
+}
+
+.modpack-btn.is-primary:hover {
+  background: var(--accent-hover);
+  transform: scale(1.01);
+}
+
+.modpack-btn.is-secondary {
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  color: var(--text);
+}
+
+.modpack-btn.is-secondary:hover {
+  background: var(--glass-row-hover);
+}
+
+.modpack-btn:active {
+  transform: scale(0.98);
+}
+
+/* ============================================================================
+   下载任务页（下载页 → 下载任务 子页）
+   ============================================================================ */
+
+/* 副导航栏上的进行中任务计数 */
+/* 选择器必须带上 .sub-sidebar-item：否则会被上面的 ".sub-sidebar-item span"
+   （特异性 0,1,1）压掉字号，徽标会变成 12px 撑破胶囊 */
+.sub-sidebar-item .sub-sidebar-badge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: #06202b;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.sub-sidebar-item {
+  position: relative;
+}
+
+.sub-sidebar-item .sub-sidebar-badge[hidden] {
+  display: none;
+}
+
+.tasks-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-bottom: var(--space-2);
+}
+
+.tasks-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.tasks-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.tasks-section-title {
+  margin: var(--space-2) 0 var(--space-1);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+}
+
+.tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.tasks-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 60px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-lg);
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+}
+
+.task-card.is-running {
+  background: rgba(0, 212, 255, 0.08);
+  border-color: rgba(0, 212, 255, 0.32);
+}
+
+.task-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.task-card-titles {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.task-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-badge {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.task-badge.is-running {
+  background: rgba(0, 212, 255, 0.2);
+  color: var(--accent);
+}
+
+.task-badge.is-done {
+  background: rgba(74, 222, 128, 0.18);
+  color: #4ade80;
+}
+
+.task-badge.is-failed {
+  background: rgba(239, 68, 68, 0.18);
+  color: var(--danger);
+}
+
+.task-badge.is-cancelled {
+  background: rgba(148, 163, 184, 0.2);
+  color: var(--info-soft);
+}
+
+.task-bar {
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.task-bar-fill {
+  height: 100%;
+  width: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 0.35s var(--ease-out);
+}
+
+.task-card.is-done .task-bar-fill {
+  background: #4ade80;
+}
+
+.task-card.is-failed .task-bar-fill {
+  background: var(--danger);
+}
+
+.task-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.task-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.task-stat-label {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.task-stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
+.task-btn {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--glass-row-border);
+  background: var(--glass-row);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.task-btn:hover {
+  background: var(--glass-row-hover);
+}
+
+.task-btn.is-danger {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: var(--danger);
+}
+
+.task-btn.is-danger:hover {
+  background: rgba(239, 68, 68, 0.16);
+}
+
+/* 下载任务页的内边距。
+   #downloadContent 是毛玻璃面板，四周有 28px 圆角，内容直接贴边的话
+   靠近圆角的部分会被吃掉，所以和其他子页一样留出统一内边距 */
+.tasks-page {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 100%;
+}
+
+/* 待在下载任务页时不显示"进度类"小通知：页面本身就是完整信息，
+   右上角再盖一张小卡片既重复又挡视线。切出去后这个类被摘掉，
+   卡片自然重新出现（任务结束时会 settle，tag 被摘掉，结果提示始终可见） */
+body.is-tasks-page .notification-card[data-tag="download"] {
+  display: none;
+}
+
+/* 空状态在整块面板里纵向居中 */
+.tasks-page .tasks-empty {
+  flex: 1;
+}
+
+/* ---- 版本管理：mod 列表折叠 ---- */
+/* 整合包动辄几百个 mod，默认只列前几个，其余收进这里 */
+.mod-fold {
+  margin-bottom: 6px;
+}
+
+.mod-fold-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 10px 14px;
+  background: transparent;
+  border: 1px dashed var(--glass-row-border);
+  border-radius: var(--radius-lg);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.mod-fold-toggle:hover {
+  background: var(--glass-row);
+  color: var(--text);
+  border-color: var(--glass-border);
+}
+
+.mod-fold.is-open .mod-fold-toggle {
+  color: var(--text);
+  border-style: solid;
+}
+
+.mod-fold-arrow {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.mod-fold-panel {
+  /* 展开后和上面的 mod 行之间留一点呼吸 */
+  margin-top: 6px;
+  animation: reveal-in 0.2s var(--ease-out);
+}
+
+.mod-fold-panel[hidden] {
+  display: none;
 }
