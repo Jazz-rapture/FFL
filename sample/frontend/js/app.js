@@ -8,6 +8,27 @@
   const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
   const motionDelay = (ms) => (motionQuery.matches ? 0 : ms);
 
+  // ---- 背景图：首帧先套上次的选择 ----
+  // 真正的值以 config.json 为准（background.list 回来后校正），但那是异步的，
+  // 等它回来再套会先亮一下默认图再跳到自定义图。这里留一份镜像，脚本执行时
+  // 就同步把 CSS 变量改掉，首帧直接是对的图
+  const BG_MIRROR_KEY = 'tauricpp.background';
+  document.documentElement.style.setProperty(
+    '--bg-image',
+    `url("${readBackgroundMirror().url || 'https://tauricpp.app/resoures/background/pic1.svg'}")`
+  );
+
+  function readBackgroundMirror() {
+    try {
+      const raw = window.localStorage.getItem(BG_MIRROR_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+      return {};
+    }
+  }
+
   // ---- 窗口操作 ----
   document.querySelector('.btn-blue').addEventListener('click', () => tauri.invoke('window.minimize'));
   document.querySelector('.btn-red').addEventListener('click', () => tauri.invoke('window.close'));
@@ -501,7 +522,7 @@
     } else if (pageName === 'settings') {
       loadSettingsContent(activeSettingsCategory);
     } else if (pageName === 'resource') {
-      loadResourceContent(activeResourceCategory);
+      loadResourceContent();
     } else if (pageName === 'online') {
       loadOnlineContent(activeOnlineCategory);
     }
@@ -1973,6 +1994,288 @@
     });
   });
 
+  // ==================== 启动器背景 ====================
+  // 内置 4 张 + <启动器目录>\Backgrounds\ 里的自定义图，都由后端
+  // background.* 管理（见 Services/BackgroundService.h）。
+  // 前端只负责把选中的 url 套到 CSS 变量 --bg-image 上
+  const bgMask = document.getElementById('bgMask');
+  const bgDialog = document.getElementById('bgDialog');
+  // 换底图时的两个辅助层（见 transitionBackground）：
+  // bgFade 负责把新图淡进来，bgVeil 负责在这期间把底图柔化
+  const bgFade = document.getElementById('bgFade');
+  const bgVeil = document.getElementById('bgVeil');
+
+  // 当前背景。启动时先按镜像显示，background.list 回来后再校正
+  let currentBackground = {
+    key: 'pic1',
+    name: '流萤幻界',
+    url: 'https://tauricpp.app/resoures/background/pic1.svg'
+  };
+  Object.assign(currentBackground, readBackgroundMirror());
+
+  function setCurrentBackground(background) {
+    if (!background || !background.url) return;
+    currentBackground = {
+      key: background.key || currentBackground.key,
+      name: background.name || currentBackground.name,
+      url: background.url
+    };
+    // 页面所有背景都由 :root 的 --bg-image 驱动（见 style.css），
+    // 改这个变量就等于换底图
+    document.documentElement.style.setProperty('--bg-image', `url("${currentBackground.url}")`);
+    try {
+      window.localStorage.setItem(BG_MIRROR_KEY, JSON.stringify(currentBackground));
+    } catch (error) {
+      // 隐私模式之类写不进去就只是丢了首帧镜像，不影响功能
+    }
+
+    // 设置页里的名字可能要跟着改
+    const label = document.getElementById('bgCurrentLabel');
+    if (label) label.textContent = currentBackground.name;
+  }
+
+  // 后端是唯一权威：配置读出来以后覆盖镜像值。
+  // 脚本求值阶段和 load 之后各同步一次 —— 太早发起的 invokes 有可能在
+  // 页面/桥接还没完全就绪时丢掉，那正是"重启后背景还是默认图"的成因。
+  // 这个同步是幂等的，重复调用只会把同一个值再写一次 CSS 变量
+  function syncBackgroundFromBackend() {
+    tauri.invoke('background.list').then((result) => {
+      if (result && result.ok && result.current) setCurrentBackground(result.current);
+    }).catch(() => {});
+  }
+  syncBackgroundFromBackend();
+  window.addEventListener('load', syncBackgroundFromBackend);
+
+  function closeBackgroundDialog() {
+    if (!bgMask) return;
+    bgMask.hidden = true;
+    bgDialog.innerHTML = '';
+  }
+
+  // 每次打开都重新拉一次清单：用户很可能刚往 Backgrounds 里丢了图
+  function openBackgroundDialog() {
+    if (!bgMask || !bgDialog) return;
+    bgMask.hidden = false;
+    bgDialog.innerHTML = `
+      <div class="bg-dialog-loading">
+        <div class="download-spinner"></div>
+        <p>正在读取背景列表...</p>
+      </div>
+    `;
+
+    tauri.invoke('background.list').then((result) => {
+      if (!result || !result.ok) {
+        bgDialog.innerHTML = '<div class="bg-empty">读取背景列表失败</div>';
+        return;
+      }
+      renderBackgroundDialog(result);
+    }).catch(() => {
+      bgDialog.innerHTML = '<div class="bg-empty">读取背景列表失败</div>';
+    });
+  }
+
+  function buildBackgroundCard(item, activeKey) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'bg-card' + (item.key === activeKey ? ' is-active' : '');
+    card.dataset.key = item.key;
+    card.innerHTML = `
+      <span class="bg-card-thumb" style="background-image:url('${item.url}')"></span>
+      <span class="bg-card-name">${escapeHtml(item.name)}</span>
+    `;
+    return card;
+  }
+
+  function renderBackgroundDialog(result) {
+    const activeKey = (result.current && result.current.key) || currentBackground.key;
+    const builtins = result.builtins || [];
+    const custom = result.custom || [];
+
+    bgDialog.innerHTML = `
+      <div class="bg-dialog-title">
+        <span>背景</span>
+        <span class="bg-dialog-sub">${builtins.length + custom.length} 张可用</span>
+      </div>
+    `;
+
+    // 卡片区域单独滚动：底部那排操作（打开文件夹 / 完成）始终留在视野里，
+    // 自定义图多了也不会把它们顶出弹窗
+    const body = document.createElement('div');
+    body.className = 'bg-dialog-body';
+
+    // ---- 内置 ----
+    const builtinLabel = document.createElement('div');
+    builtinLabel.className = 'bg-section-label';
+    builtinLabel.textContent = '内置';
+    body.appendChild(builtinLabel);
+
+    const builtinGrid = document.createElement('div');
+    builtinGrid.className = 'bg-grid';
+    builtins.forEach(item => builtinGrid.appendChild(buildBackgroundCard(item, activeKey)));
+    body.appendChild(builtinGrid);
+
+    // ---- 自定义 ----
+    const customLabel = document.createElement('div');
+    customLabel.className = 'bg-section-label';
+    customLabel.textContent = '自定义';
+    body.appendChild(customLabel);
+
+    if (custom.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'bg-empty';
+      empty.textContent = '还没有自定义底图。把图片放进下面的 Backgrounds 文件夹，再点刷新就会出现在这里。';
+      body.appendChild(empty);
+    } else {
+      const customGrid = document.createElement('div');
+      customGrid.className = 'bg-grid';
+      custom.forEach(item => customGrid.appendChild(buildBackgroundCard(item, activeKey)));
+      body.appendChild(customGrid);
+    }
+
+    bgDialog.appendChild(body);
+
+    // ---- 固定底部：文件夹操作 + 完成 ----
+    const footer = document.createElement('div');
+    footer.className = 'bg-dialog-footer';
+    footer.innerHTML = `
+      <div class="bg-folder-row">
+        <button type="button" class="bg-btn is-secondary" id="bgOpenFolder">打开 Backgrounds 文件夹</button>
+        <button type="button" class="bg-btn is-secondary" id="bgRefresh">刷新</button>
+      </div>
+      <div class="bg-dialog-hint">支持 jpg / png / bmp / gif / webp / avif，文件名就是卡片名</div>
+      <button type="button" class="bg-btn" id="bgClose">完成</button>
+    `;
+    bgDialog.appendChild(footer);
+
+    bgDialog.querySelectorAll('.bg-card').forEach(card => {
+      card.addEventListener('click', () => selectBackground(card.dataset.key));
+    });
+
+    bgDialog.querySelector('#bgOpenFolder').addEventListener('click', () => {
+      tauri.invoke('background.openFolder').then((res) => {
+        if (!res || !res.ok) {
+          showNotification({
+            title: '打开失败',
+            content: '无法打开 Backgrounds 文件夹',
+            type: 'error',
+            duration: 5000
+          });
+        }
+      }).catch(() => {});
+    });
+    bgDialog.querySelector('#bgRefresh').addEventListener('click', () => openBackgroundDialog());
+    bgDialog.querySelector('#bgClose').addEventListener('click', () => closeBackgroundDialog());
+  }
+
+  // 点遮罩关掉弹窗：只挂一次，别跟着每次重绘叠加
+  if (bgMask) {
+    bgMask.addEventListener('click', (event) => {
+      if (event.target === bgMask) closeBackgroundDialog();
+    });
+  }
+
+  // 换底图的整段动画（约 1080ms）：界面退场 → 背景在模糊里交叉渐变 →
+  // 界面从模糊里浮回来 → 收模糊。
+  //
+  // 四段是**交叠**的，不是接力：每一段还没收尾，下一段就已经起手。
+  // 之前按"上一段跑完才起下一段"排，每段收尾时画面都会定住一瞬，
+  // 四个节拍就散成了四段独立动画。
+  // 唯一必须保持的先后是"收模糊"排在"界面回来"之后 —— 否则会出现
+  // 整屏清晰、界面还没落位的那一帧。
+  const BG_CROSSFADE_MS = 440;   // 与 .bg-fade 的 opacity 0.44s 对齐
+  const BG_FOCUS_MS = 380;       // 与 .bg-veil 的 backdrop-filter 0.38s 对齐
+  // 界面淡出/淡入的 0.32s 写在 .is-bg-fading 里，这里只需要知道它的起手时刻
+
+  const BG_CROSSFADE_AT = 120;   // 界面刚退到小半就开始换图
+  const BG_RETURN_AT = 380;      // 渐变尾声界面已经在回来了
+  // 新图盖满的那一刻。真正的 --bg-image 必须等到这里才换：
+  // 渐变层那时才 100% 不透明，底下的图当场变掉是看不见的；
+  // 提前到界面回来的 380ms 换，会正好在半透明时露馅
+  const BG_SWAP_AT = BG_CROSSFADE_AT + BG_CROSSFADE_MS;
+  const BG_END_MS = BG_SWAP_AT + BG_FOCUS_MS;
+  let bgSwitching = false;
+
+  function transitionBackground(background, onSwapped) {
+    if (bgSwitching || !background || !background.url) return;
+
+    // 跟随系统"减少动效"时不做这套编排，直接换
+    if (motionQuery.matches) {
+      if (onSwapped) onSwapped();
+      setCurrentBackground(background);
+      return;
+    }
+
+    bgSwitching = true;
+    bgFade.style.backgroundImage = `url("${background.url}")`;
+    document.body.classList.add('is-bg-fading', 'is-bg-receded', 'is-bg-locked');
+    // 底图先柔化：这一层盖在界面之上，所以界面也是"化进模糊里"的。
+    // 先上 is-active 把 display:none 换成 block 并落一帧 blur(0px) 基线，
+    // 否则从 display:none 直接加 is-blurred 是没有起点可插值的，模糊会跳出来
+    bgVeil.classList.add('is-active');
+    void bgVeil.offsetWidth;
+    bgVeil.classList.add('is-blurred');
+
+    // 界面还没退干净就起手换图：等到全透明再开始的话，中间会空一拍
+    setTimeout(() => bgFade.classList.add('is-visible'), BG_CROSSFADE_AT);
+
+    // 渐变还没走完就让界面回来。此时底图已经很软，界面在模糊里浮出，
+    // 和渐变的收尾叠在一起，不会读成"图换完了，然后界面出现"
+    setTimeout(() => {
+      if (onSwapped) onSwapped();
+      document.body.classList.remove('is-bg-receded');
+    }, BG_RETURN_AT);
+
+    // 新图完全盖住旧图：这时候换底图 + 收模糊。画面已被 UI 盖住，
+    // 变清晰的只有 UI 没盖住的缝隙，玻璃面板后面由它们自己的模糊撑着
+    setTimeout(() => {
+      setCurrentBackground(background);
+      bgVeil.classList.remove('is-blurred');
+    }, BG_SWAP_AT);
+
+    // 收尾。过渡层此时和 body 背景是同一张图，淡出它不会有任何视觉变化
+    setTimeout(() => {
+      bgFade.classList.remove('is-visible');
+      bgVeil.classList.remove('is-active');
+      document.body.classList.remove('is-bg-fading', 'is-bg-locked');
+      bgSwitching = false;
+    }, BG_END_MS);
+  }
+
+  function selectBackground(key) {
+    if (bgSwitching) return;
+
+    tauri.invoke('background.select', { key }).then((result) => {
+      if (!result || !result.ok) {
+        showNotification({
+          title: '切换背景失败',
+          content: (result && result.error) || '切换背景失败',
+          type: 'error',
+          duration: 5000
+        });
+        return;
+      }
+      // 后端存下来了但没给出可用的地址：以前这里会静默什么都不做，
+      // 看起来就像点了没反应。宁可报出来
+      if (!result.current || !result.current.url) {
+        showNotification({
+          title: '切换背景失败',
+          content: '后端没有返回可用的背景地址',
+          type: 'error',
+          duration: 5000
+        });
+        return;
+      }
+
+      // 先把点中的卡片标成选中，界面退场前的这 180ms 里有即时反馈
+      bgDialog.querySelectorAll('.bg-card').forEach(card => {
+        card.classList.toggle('is-active', card.dataset.key === key);
+      });
+      transitionBackground(result.current, () => closeBackgroundDialog());
+    }).catch(() => {
+      showNotification({ title: '切换背景失败', content: '切换背景失败', type: 'error', duration: 5000 });
+    });
+  }
+
   function loadGeneralSettings() {
     settingsContent.innerHTML = '';
     const wrapper = document.createElement('div');
@@ -2001,6 +2304,16 @@
         <span class="settings-item-value">无</span>
       `;
       wrapper.appendChild(proxyRow);
+
+      // 背景：右边显示当前底图名字，点开是卡片选择弹窗
+      const bgRow = document.createElement('div');
+      bgRow.className = 'settings-item';
+      bgRow.innerHTML = `
+        <span class="settings-item-label">背景</span>
+        <span class="settings-item-value" id="bgCurrentLabel">${escapeHtml(currentBackground.name)}</span>
+      `;
+      bgRow.addEventListener('click', () => openBackgroundDialog());
+      wrapper.appendChild(bgRow);
 
       // 消息测试按钮（调试用）
       const testRow = document.createElement('div');
@@ -2487,9 +2800,18 @@
   }
 
   // ==================== 资源管理页逻辑 ====================
+  // 这一页的副导航栏有两种形态，共用同一根栏：
+  //   versions —— 已下载版本列表
+  //   instance —— 单个版本的分层管理：游戏设置 / 模组 / 资源包 / 光影包
+  // 从列表点「版本设置」进实例时，整条副导航栏退场重进，内容区同时换成
+  // 对应的分类。这样几百个 mod 有自己的整页空间，不用挤在版本详情里折叠。
   const resourceContent = document.getElementById('resourceContent');
-  const resourceSubSidebarItems = document.querySelectorAll('#resourceSubSidebar .sub-sidebar-item');
-  let activeResourceCategory = 'versions';
+  const resourceSubSidebar = document.getElementById('resourceSubSidebar');
+
+  let resourceNavMode = 'versions';
+  let activeResourceTab = 'versions';
+  // instance 模式下正在管理的版本（version.getInstalled 返回的那一项）
+  let resourceInstance = null;
 
   // 固定到主页的版本名（profileName），存在 config.json 的 game.pinnedVersions 里。
   // 主页左下角的版本卡片只列这里的版本，其余一律不显示
@@ -2503,18 +2825,125 @@
     return pinnedVersionNames.indexOf(profileName) !== -1;
   }
 
-  function loadResourceContent(category) {
-    if (category === 'versions') loadResourceVersions();
+  const RESOURCE_NAV_ITEMS = {
+    versions: [
+      { tab: 'versions', label: '版本', icon: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>' }
+    ],
+    instance: [
+      { tab: 'settings', label: '游戏设置', icon: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>' },
+      { tab: 'mods', label: '模组', icon: '<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>' },
+      { tab: 'resourcepacks', label: '资源包', icon: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>' },
+      { tab: 'shaderpacks', label: '光影包', icon: '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>' },
+      { tab: 'back', label: '返回', icon: '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>' }
+    ]
+  };
+
+  function renderResourceNav() {
+    const items = RESOURCE_NAV_ITEMS[resourceNavMode];
+    resourceSubSidebar.innerHTML = items.map(item => `
+      <button type="button" class="sub-sidebar-item${item.tab === activeResourceTab ? ' active' : ''}" data-tab="${item.tab}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${item.icon}</svg>
+        <span>${item.label}</span>
+      </button>
+    `).join('');
+    // 实例模式下「返回」要沉到栏底，靠这条类选择器（见 style.css）
+    resourceSubSidebar.classList.toggle('is-instance', resourceNavMode === 'instance');
   }
 
-  resourceSubSidebarItems.forEach(item => {
-    item.addEventListener('click', () => {
-      resourceSubSidebarItems.forEach(i => i.classList.remove('active'));
-      item.classList.add('active');
-      activeResourceCategory = item.dataset.category;
-      loadResourceContent(activeResourceCategory);
-    });
+  // 展示区换内容：先淡出（.is-swapping 只给 0.16s，比导航的滑出快），
+  // 换完 DOM 再淡回来，新插入的行自己播 stagger-in。
+  // 不这么做的话内容会在导航滑到一半时硬切，和周围的动效完全不在一个节奏上
+  function swapResourceContent(mutate, outMs) {
+    resourceContent.classList.add('is-swapping');
+    setTimeout(() => {
+      mutate();
+      resourceContent.classList.remove('is-swapping');
+    }, motionDelay(outMs));
+  }
+
+  // 副导航栏退场重进：导航滑出的同时内容一起淡出，
+  // 换完导航项和内容后两边再一起进场
+  function swapResourceNav(mutate) {
+    resourceSubSidebar.classList.remove('slide-in');
+    resourceSubSidebar.classList.add('slide-out');
+    swapResourceContent(() => {
+      mutate();
+      resourceSubSidebar.classList.remove('slide-out');
+      // 这 180ms 里用户可能已经切到别的页了，那就别再把它滑出来
+      if (resourcePage.classList.contains('active')) {
+        void resourceSubSidebar.offsetWidth;   // 强制重排，滑入动画才会重播
+        resourceSubSidebar.classList.add('slide-in');
+      }
+    }, 180);
+  }
+
+  // 副导航栏点击（内容是动态生成的，所以用事件委托）
+  resourceSubSidebar.addEventListener('click', (event) => {
+    const item = event.target.closest('.sub-sidebar-item');
+    if (!item) return;
+    const tab = item.dataset.tab;
+    if (tab === 'back') {
+      backToResourceVersions();
+      return;
+    }
+    if (tab === activeResourceTab) return;
+    activeResourceTab = tab;
+    // 导航本身不动（只是高亮换位），所以只让展示区做个短一点的淡出淡入，
+    // 否则内容还是硬切，跟刚进实例时的过渡对不上。
+    // 160ms 要略大于 .is-swapping 的 0.16s 退场，换 DOM 时才看不见
+    renderResourceNav();
+    swapResourceContent(renderResourceTab, 160);
   });
+
+  function loadResourceContent() {
+    renderResourceNav();
+    renderResourceTab();
+  }
+
+  function renderResourceTab() {
+    if (resourceNavMode === 'versions' || !resourceInstance) {
+      loadResourceVersions();
+      return;
+    }
+    if (activeResourceTab === 'settings') {
+      renderInstanceSettings(resourceInstance);
+    } else {
+      renderInstanceFiles(resourceInstance, activeResourceTab);
+    }
+  }
+
+  // 从版本列表进入实例管理：副导航栏退场重进 + 内容换成「游戏设置」
+  function openResourceInstance(v) {
+    resourceInstance = v;
+    resourceNavMode = 'instance';
+    activeResourceTab = 'settings';
+    swapResourceNav(() => {
+      renderResourceNav();
+      renderResourceTab();
+    });
+  }
+
+  function backToResourceVersions() {
+    resourceInstance = null;
+    resourceNavMode = 'versions';
+    activeResourceTab = 'versions';
+    swapResourceNav(() => {
+      renderResourceNav();
+      // 列表要重拉一遍：刚在实例里删过版本的话这里得反映出来
+      loadResourceVersions();
+    });
+  }
+
+  // 实例页统一的小标题条：左边版本名（导航栏里看不到是哪个版本），右边当前分类
+  function buildInstanceHead(label) {
+    const head = document.createElement('div');
+    head.className = 'resource-instance-head';
+    head.innerHTML = `
+      <span class="resource-instance-name">${escapeHtml(resourceInstance.profileName)}</span>
+      <span class="resource-instance-tab">${label}</span>
+    `;
+    return head;
+  }
 
   function loadResourceVersions() {
     resourceContent.innerHTML = `
@@ -2578,7 +3007,7 @@
     applyPinState(pinBtn, v.profileName);
 
     launchBtn.addEventListener('click', () => launchVersionFromList(v.profileName, launchBtn));
-    row.querySelector('.version-manage-setup').addEventListener('click', () => showResourceVersionDetail(v));
+    row.querySelector('.version-manage-setup').addEventListener('click', () => openResourceInstance(v));
 
     pinBtn.addEventListener('click', () => {
       const next = !isVersionPinned(v.profileName);
@@ -2625,22 +3054,14 @@
     });
   }
 
-  function showResourceVersionDetail(v) {
+  // 实例的「游戏设置」页：版本信息 + 删除。mod / 资源包 / 光影包
+  // 各自有独立分页，这里只放跟这个版本本身有关的静态信息
+  function renderInstanceSettings(v) {
     resourceContent.innerHTML = '';
     const wrapper = document.createElement('div');
     wrapper.className = 'settings-section';
 
-    const backRow = document.createElement('div');
-    backRow.className = 'settings-item';
-    backRow.style.cursor = 'pointer';
-    backRow.innerHTML = `<span class="settings-item-label">&#9664; 返回</span>`;
-    backRow.addEventListener('click', () => loadResourceVersions());
-    wrapper.appendChild(backRow);
-
-    const title = document.createElement('div');
-    title.className = 'settings-section-title';
-    title.textContent = v.profileName;
-    wrapper.appendChild(title);
+    wrapper.appendChild(buildInstanceHead('游戏设置'));
 
     const info = [
       { label: '版本名称', value: v.profileName },
@@ -2650,36 +3071,12 @@
     info.forEach(item => {
       const row = document.createElement('div');
       row.className = 'settings-item';
+      row.style.cursor = 'default';
       row.innerHTML = `
         <span class="settings-item-label">${item.label}</span>
-        <span class="settings-item-value">${item.value}</span>
+        <span class="settings-item-value">${escapeHtml(item.value)}</span>
       `;
       wrapper.appendChild(row);
-    });
-
-    // ---- Mod 列表：这个版本 mods 文件夹里的所有 mod，点一行切换启用状态 ----
-    const modTitle = document.createElement('div');
-    modTitle.className = 'settings-section-title';
-    modTitle.textContent = 'Mod 列表';
-    wrapper.appendChild(modTitle);
-
-    const modListWrap = document.createElement('div');
-    modListWrap.innerHTML = `
-      <div class="download-loading" style="height:auto;padding:14px;">
-        <div class="download-spinner"></div>
-        <p>正在读取 mods 文件夹...</p>
-      </div>
-    `;
-    wrapper.appendChild(modListWrap);
-
-    tauri.invoke('game.listMods', { version: v.profileName }).then((result) => {
-      if (!result || !result.ok) {
-        modListWrap.innerHTML = '<div class="settings-item"><span class="settings-item-label">读取 mods 文件夹失败</span></div>';
-        return;
-      }
-      renderModList(modListWrap, v.profileName, result);
-    }).catch(() => {
-      modListWrap.innerHTML = '<div class="settings-item"><span class="settings-item-label">读取 mods 文件夹失败</span></div>';
     });
 
     const deleteRow = document.createElement('div');
@@ -2689,7 +3086,7 @@
       if (confirm(`确定要删除版本 ${v.profileName} 吗？`)) {
         tauri.invoke('version.delete', { profileName: v.profileName }).then((result) => {
           if (result && result.ok) {
-            loadResourceVersions();
+            backToResourceVersions();
             loadVersionCard();
           } else {
             alert((result && result.error) || '删除失败');
@@ -2702,87 +3099,114 @@
     resourceContent.appendChild(wrapper);
   }
 
-  // 某个版本的 mod 列表。停用的 mod 是把扩展名换成 .disabled，
-  // 加载器只认 .jar，所以改掉名字就不会被读进去
-  // 版本管理里默认只列前几个 mod。整合包动辄三四百个 mod，
-  // 全铺出来会把整页撑爆、还得滚很久才找得到下面的"删除此版本"
-  const MOD_LIST_PREVIEW_COUNT = 3;
+  // 三个分页各自的文案。目录名同时也是后端 game.listMods 的 category
+  const CONTENT_CATEGORY_TEXT = {
+    mods: {
+      label: '模组',
+      loading: '正在读取 mods 文件夹...',
+      empty: 'mods 文件夹是空的',
+      shared: '当前未开启版本隔离，所有版本共用 .minecraft\\mods，这里的改动会影响其它版本'
+    },
+    resourcepacks: {
+      label: '资源包',
+      loading: '正在读取 resourcepacks 文件夹...',
+      empty: 'resourcepacks 文件夹是空的',
+      shared: '当前未开启版本隔离，所有版本共用 .minecraft\\resourcepacks，这里的改动会影响其它版本'
+    },
+    shaderpacks: {
+      label: '光影包',
+      loading: '正在读取 shaderpacks 文件夹...',
+      empty: 'shaderpacks 文件夹是空的',
+      shared: '当前未开启版本隔离，所有版本共用 .minecraft\\shaderpacks，这里的改动会影响其它版本'
+    }
+  };
 
-  function renderModList(container, versionName, result) {
+  // 模组 / 资源包 / 光影包分页：整页铺开，文件多了由内容面板自己滚动，
+  // 不再折叠——这也是把它们从版本详情里拆出来的原因
+  function renderInstanceFiles(v, category) {
+    const text = CONTENT_CATEGORY_TEXT[category] || CONTENT_CATEGORY_TEXT.mods;
+
+    resourceContent.innerHTML = '';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'settings-section';
+    wrapper.appendChild(buildInstanceHead(text.label));
+
+    const body = document.createElement('div');
+    body.innerHTML = `
+      <div class="download-loading" style="height:auto;padding:14px;">
+        <div class="download-spinner"></div>
+        <p>${text.loading}</p>
+      </div>
+    `;
+    wrapper.appendChild(body);
+    resourceContent.appendChild(wrapper);
+
+    tauri.invoke('game.listMods', { version: v.profileName, category }).then((result) => {
+      // 请求回来时用户可能已经切到别的分页/退出实例了，别往已经换掉的面板里写
+      if (!body.isConnected) return;
+      renderFileList(body, v.profileName, category, result);
+    }).catch(() => {
+      if (!body.isConnected) return;
+      body.innerHTML = `<div class="settings-item"><span class="settings-item-label">读取 ${category} 文件夹失败</span></div>`;
+    });
+  }
+
+  function renderFileList(container, versionName, category, result) {
+    const text = CONTENT_CATEGORY_TEXT[category] || CONTENT_CATEGORY_TEXT.mods;
     container.innerHTML = '';
+    // 加载态到结果不该是硬切：这里补一次淡入，正常当场返回时它会和面板的进场叠在一起
+    container.classList.add('is-revealing');
 
-    // 没开版本隔离时多个版本共用同一个 mods 文件夹，得说清楚
+    if (!result || !result.ok) {
+      container.innerHTML = `<div class="settings-item"><span class="settings-item-label">读取 ${category} 文件夹失败</span></div>`;
+      return;
+    }
+
+    // 没开版本隔离时多个版本共用同一个目录，得说清楚
     if (result.shared) {
       const shared = document.createElement('div');
       shared.className = 'settings-item-hint';
-      shared.textContent = '当前未开启版本隔离，所有版本共用 .minecraft\\mods，这里的改动会影响其它版本';
+      shared.textContent = text.shared;
       container.appendChild(shared);
     }
 
-    const mods = result.mods || [];
-    if (mods.length === 0) {
+    const files = result.files || [];
+    if (files.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'settings-item';
-      empty.innerHTML = `<span class="settings-item-label" style="color:rgba(255,255,255,0.68);">mods 文件夹是空的</span>`;
+      empty.style.cursor = 'default';
+      empty.innerHTML = `<span class="settings-item-label" style="color:rgba(255,255,255,0.68);">${text.empty}</span>`;
       container.appendChild(empty);
       return;
     }
 
     // 启用的排前面，其余按文件名排
-    const sorted = mods.slice().sort(
+    const sorted = files.slice().sort(
       (a, b) => (Number(b.enabled) - Number(a.enabled)) || a.enabledName.localeCompare(b.enabledName)
     );
+    const enabledCount = sorted.filter(file => file.enabled).length;
 
-    const visible = sorted.slice(0, MOD_LIST_PREVIEW_COUNT);
-    const rest = sorted.slice(MOD_LIST_PREVIEW_COUNT);
+    const summary = document.createElement('div');
+    summary.className = 'resource-file-summary';
+    summary.textContent = `共 ${sorted.length} 个，已启用 ${enabledCount} 个`;
+    container.appendChild(summary);
 
-    visible.forEach(mod => container.appendChild(buildModRow(versionName, mod)));
-
-    if (rest.length === 0) return;
-
-    const fold = document.createElement('div');
-    fold.className = 'mod-fold';
-
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = 'mod-fold-toggle';
-
-    const panel = document.createElement('div');
-    panel.className = 'mod-fold-panel';
-    panel.hidden = true;
-
-    const paint = (open) => {
-      toggle.innerHTML = `<span>${open ? '收起' : '展开'}其余 ${rest.length} 个 mod</span><span class="mod-fold-arrow">${open ? '▴' : '▾'}</span>`;
-    };
-    paint(false);
-
-    // 懒渲染：几百个 mod 一次性建 DOM 会卡一下，第一次展开时才建
-    let built = false;
-    toggle.addEventListener('click', () => {
-      const open = panel.hidden;
-      if (open && !built) {
-        rest.forEach(mod => panel.appendChild(buildModRow(versionName, mod)));
-        built = true;
-      }
-      panel.hidden = !open;
-      fold.classList.toggle('is-open', open);
-      paint(open);
-    });
-
-    fold.appendChild(toggle);
-    fold.appendChild(panel);
-    container.appendChild(fold);
+    // 几百个文件一次建 DOM 也扛得住；容器本身有滚动，不做分页
+    const list = document.createElement('div');
+    list.className = 'resource-file-list';
+    sorted.forEach(file => list.appendChild(buildFileRow(versionName, category, file)));
+    container.appendChild(list);
   }
 
-  function buildModRow(versionName, mod) {
+  function buildFileRow(versionName, category, file) {
     const row = document.createElement('div');
     row.className = 'settings-item mod-toggle-row';
 
     const render = () => {
       row.innerHTML = `
-        <span class="mod-toggle-state ${mod.enabled ? 'is-on' : 'is-off'}">${mod.enabled ? '已启用' : '已停用'}</span>
-        <span class="settings-item-label mod-toggle-name" title="${mod.name}">${mod.enabledName}</span>
-        <span class="settings-item-value">${mod.enabled ? '点击停用' : '点击启用'}</span>
+        <span class="mod-toggle-state ${file.enabled ? 'is-on' : 'is-off'}">${file.enabled ? '已启用' : '已停用'}</span>
+        <span class="settings-item-label mod-toggle-name" title="${escapeHtml(file.name)}">${escapeHtml(file.enabledName)}</span>
+        <span class="settings-item-value">${file.enabled ? '点击停用' : '点击启用'}</span>
       `;
     };
     render();
@@ -2791,8 +3215,9 @@
       row.style.opacity = '0.5';
       tauri.invoke('game.toggleMod', {
         version: versionName,
-        name: mod.name,
-        enable: !mod.enabled
+        category,
+        name: file.name,
+        enable: !file.enabled
       }).then((res) => {
         row.style.opacity = '';
         if (!res || !res.ok) {
@@ -2804,9 +3229,9 @@
           });
           return;
         }
-        mod.enabled = res.enabled;
-        mod.name = res.name;
-        mod.enabledName = res.enabled ? res.name : res.name.replace(/\.disabled$/, '');
+        file.enabled = res.enabled;
+        file.name = res.name;
+        file.enabledName = res.enabled ? res.name : res.name.replace(/\.disabled$/, '');
         render();
       }).catch(() => {
         row.style.opacity = '';

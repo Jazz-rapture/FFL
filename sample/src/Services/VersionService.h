@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include "Core/ConfigManager.h"
@@ -324,15 +325,23 @@ private:
             std::wstring dirName = findData.cFileName;
             if (dirName == L"." || dirName == L"..") continue;
 
-            std::wstring jsonSearch = versionsDir + L"\\" + dirName + L"\\*.json";
+            // 版本目录里可能不止一个 json —— 整合包实例安装期间会同时存在
+            // 原版 JSON（<mc版本>.json）和加载器 JSON（<实例名>.json）。
+            // 优先取和目录同名的那个，和 GameLaunchService 启动时挑 JSON 的
+            // 规则一致，否则版本列表显示的元数据会和实际启动的版本对不上
+            std::vector<std::wstring> jsonCandidates = {
+                versionsDir + L"\\" + dirName + L"\\" + dirName + L".json"
+            };
             WIN32_FIND_DATAW jsonData;
-            HANDLE hJson = FindFirstFileW(jsonSearch.c_str(), &jsonData);
-            if (hJson == INVALID_HANDLE_VALUE) continue;
+            HANDLE hJson = FindFirstFileW((versionsDir + L"\\" + dirName + L"\\*.json").c_str(), &jsonData);
+            if (hJson != INVALID_HANDLE_VALUE) {
+                do {
+                    jsonCandidates.push_back(versionsDir + L"\\" + dirName + L"\\" + jsonData.cFileName);
+                } while (FindNextFileW(hJson, &jsonData));
+                FindClose(hJson);
+            }
 
-            do {
-                std::wstring jsonName = jsonData.cFileName;
-                std::wstring jsonPath = versionsDir + L"\\" + dirName + L"\\" + jsonName;
-
+            for (const std::wstring& jsonPath : jsonCandidates) {
                 std::ifstream ifs(jsonPath);
                 if (!ifs.is_open()) continue;
                 std::stringstream ss;
@@ -353,9 +362,7 @@ private:
                 } catch (...) {
                     continue;
                 }
-            } while (FindNextFileW(hJson, &jsonData));
-
-            FindClose(hJson);
+            }
         } while (FindNextFileW(hFind, &findData));
 
         FindClose(hFind);

@@ -13,6 +13,7 @@
 
 // Services 层
 #include "Services/AccountService.h"
+#include "Services/BackgroundService.h"
 #include "Services/MsaAuthService.h"
 #include "Services/YggdrasilAuthService.h"
 #include "Services/VersionService.h"
@@ -51,6 +52,10 @@ int WINAPI WinMain(
     config.window_config.bg_color = RGB(0x6a, 0x6c, 0xc4);
     // 等页面渲染出来再显示窗口（窗口以"可见但全透明"的方式存在）
     config.window_config.reveal_when_ready = true;
+    // 自定义背景图目录映射给前端：页面是 https://tauricpp.app，加载不了 file://，
+    // 只能走这个虚拟主机（见 Services/BackgroundService.h）
+    config.window_config.folder_hosts.push_back(
+        {"backgrounds.tauricpp.app", Core::FileManager::GetExeDir() + L"\\Backgrounds"});
 
     // 初始化核心组件
     Core::ConfigManager::EnsureConfigExists();
@@ -80,6 +85,8 @@ int WINAPI WinMain(
     modrinthService.SetApp(&app);
     // 联机（内网穿透）：令牌来自用户输入，隧道由本地 frpc 拉起
     Services::MultiplayerService multiplayerService(bridge);
+    // 启动器背景图（内置 4 张 + Backgrounds 目录里的自定义图）
+    Services::BackgroundService backgroundService(bridge);
 
     // shell.open - 在默认浏览器中打开URL
     bridge.RegisterCommand("shell.open", [](const nlohmann::json& args) -> nlohmann::json {

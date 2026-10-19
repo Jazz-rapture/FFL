@@ -1,13 +1,15 @@
 #pragma once
 // ModpackService.h - 整合包安装（Modrinth .mrpack / CurseForge .zip）
 //
-// 逻辑对齐 PCL 的 Mods/Minecraft/ModModpack.vb，但安装落盘布局沿用本项目
-// 现有的那一套（见 DownloadService / GameLaunchService）：
+// 逻辑对齐 PCL 的 Mods/Minecraft/ModModpack.vb，落盘布局也按 PCL 的自包含模式来：
 //
-//   versions\<实例名>\<mc>.json          ← version.download 写入
-//   versions\<实例名>\<mc>.jar           ← client.download 写入
-//   versions\<实例名>\<实例名>.json      ← 加载器安装写入（inheritsFrom = <mc>）
+//   versions\<实例名>\<实例名>.json      ← 原版 + 加载器静态合并后的完整 JSON
+//   versions\<实例名>\<mc版本>.jar       ← 原版客户端 jar
+//   versions\<实例名>\<mc版本>.json      ← 安装期的中间产物，合并完即删除
 //   versions\<实例名>\(mods|config|...)  ← 整合包 overrides + 下载的文件
+//
+// 实例目录里自带版本 JSON 和游戏核心 jar，不依赖 versions\<mc版本>\ 还能不能存在，
+// 整个文件夹可以搬走。libraries / assets 仍然全局共享（PCL 也是这样）。
 //
 // 原版与加载器的安装不另起炉灶，直接复用 DownloadService 的下载管线
 // （RunStep）和 ModLoaderService 的安装实现（InstallLoaderSync），
@@ -296,9 +298,9 @@ private:
                           const std::wstring& instance_dir, std::string& error);
     bool DownloadModFiles(const PackInfo& info, const std::wstring& instance_dir,
                           std::string& error, bool include_optional);
-    // 原版一律装到 versions\<mc_version>\ —— inheritsFrom 要靠这个目录才能被解析，
-    // 这也是 PCL / HMCL / 官启认的标准布局
-    bool InstallVanilla(const PackInfo& info, std::string& error);
+    // 原版装进实例目录，让实例自包含（对齐 PCL）：实例不再依赖 versions\<mc版本>\，
+    // 删掉那份原版之后实例照样能启动，整个实例文件夹也可以直接搬走
+    bool InstallVanilla(const PackInfo& info, const std::string& instance_name, std::string& error);
     bool InstallLoader(const PackInfo& info, const std::string& instance_name, std::string& error);
     bool FinalizeInstance(const PackInfo& info, const std::string& instance_name, std::string& error);
 
@@ -504,6 +506,78 @@ inline bool JsonBool(const nlohmann::json& obj, const char* key, bool fallback) 
     const auto it = obj.find(key);
     if (it == obj.end() || !it->is_boolean()) return fallback;
     return it->get<bool>();
+}
+
+// ============================================================================
+// 把加载器 JSON 静态合并进原版 JSON，产出一份不带 inheritsFrom 的完整版本 JSON
+// （对齐 PCL 的 MergeJson）。
+//
+// 合并顺序必须和 GameLaunchService 运行时的合并保持一致：父版本在前、子版本在后。
+// libraries 按 name 去重（后出现的覆盖先出现的）；arguments.game / arguments.jvm
+// 直接拼接 —— 漏了任何一边都会出事：原版提供 --username / --gameDir，
+// 加载器提供 --launchTarget / --fml.*，缺一头游戏都起不来。
+//
+// 其余字段（assetIndex / assets / downloads / logging / javaVersion）保持原版的值，
+// 加载器只覆盖它自己声明的东西（mainClass、libraries、arguments，旧版还有
+// minecraftArguments）。
+// ============================================================================
+inline nlohmann::json MergeVersionJson(const nlohmann::json& parent, const nlohmann::json& child) {
+    nlohmann::json merged = parent.is_object() ? parent : nlohmann::json::object();
+    const bool has_child = child.is_object() && !child.empty();
+
+    // libraries：父在前、子在后，同名以子为准
+    {
+        nlohmann::json libs = nlohmann::json::array();
+        std::map<std::string, size_t> by_name;
+        auto append = [&libs, &by_name](const nlohmann::json& src) {
+            if (!src.is_object() || !src.contains("libraries") || !src["libraries"].is_array()) return;
+            for (const auto& lib : src["libraries"]) {
+                const std::string name = lib.is_object() ? JsonStr(lib, "name") : std::string();
+                if (name.empty()) {
+                    libs.push_back(lib);
+                    continue;
+                }
+                const auto it = by_name.find(name);
+                if (it != by_name.end()) {
+                    libs[it->second] = lib;
+                    continue;
+                }
+                by_name[name] = libs.size();
+                libs.push_back(lib);
+            }
+        };
+        append(parent);
+        append(child);
+        if (!libs.empty()) merged["libraries"] = libs;
+    }
+
+    // arguments.game / arguments.jvm：父在前、子在后，直接拼接
+    for (const char* key : {"game", "jvm"}) {
+        nlohmann::json collected = nlohmann::json::array();
+        auto append = [&collected, key](const nlohmann::json& src) {
+            if (!src.is_object() || !src.contains("arguments") || !src["arguments"].is_object()) return;
+            const auto& args = src["arguments"];
+            if (!args.contains(key) || !args[key].is_array()) return;
+            for (const auto& item : args[key]) collected.push_back(item);
+        };
+        append(parent);
+        append(child);
+        if (!collected.empty()) merged["arguments"][key] = collected;
+    }
+
+    if (has_child) {
+        if (child.contains("mainClass")) merged["mainClass"] = child["mainClass"];
+        // 旧版加载器（Forge ≤1.12.2）只有 minecraftArguments 一个字符串，
+        // 且它已经是「原版参数 + Forge 追加」的完整一份。
+        // GameLaunchService 只会用其中一份，所以子版本有就整个替换
+        if (child.contains("minecraftArguments") && child["minecraftArguments"].is_string()) {
+            merged["minecraftArguments"] = child["minecraftArguments"];
+        }
+    }
+
+    // 合并完就不再需要继承了
+    merged.erase("inheritsFrom");
+    return merged;
 }
 
 // ============================================================================
@@ -1190,9 +1264,18 @@ inline bool ModpackService::DownloadModFiles(const PackInfo& info, const std::ws
 }
 
 // ============================================================================
-// 装原版：完整复用前端的下载管线，保证落盘布局和手动下载装出来的一致
+// 装原版：下到实例目录里，让实例自包含（对齐 PCL）
+//
+// 原版 JSON 落在 versions\<实例名>\<mc版本>.json、客户端 jar 落在
+// versions\<实例名>\<mc版本>.jar。两者都在 FinalizeInstance 里被合并进
+// <实例名>.json 并清掉中间产物，最终实例目录里就是「一份 JSON + 一个 jar」。
+//
+// 之所以不装到共享的 versions\<mc版本>\：整合包实例不能依赖外部那份原版还
+// 能不能存在，否则用户删掉/重装原版，整个实例就启动不了。代价是每个实例
+// 多占一份客户端 jar（20MB 上下），这是 PCL 一直以来的取舍。
 // ============================================================================
-inline bool ModpackService::InstallVanilla(const PackInfo& info, std::string& error) {
+inline bool ModpackService::InstallVanilla(const PackInfo& info, const std::string& instance_name,
+                                           std::string& error) {
     // 1) 版本 JSON 的地址要先从本地版本清单里查出来
     std::string version_url;
     {
@@ -1231,8 +1314,10 @@ inline bool ModpackService::InstallVanilla(const PackInfo& info, std::string& er
     EmitProgress("vanilla", "正在获取 Minecraft " + info.mc_version + " 版本信息…",
                  PercentAt("vanilla", 0, 100));
 
+    // versionId 决定落地目录、actualVersionId 决定文件名：
+    // 这一组参数把原版 JSON 写到 versions\<实例名>\<mc版本>.json
     nlohmann::json version_result = download_.RunStep(
-        "version", {{"url", version_url}, {"versionId", info.mc_version}, {"actualVersionId", info.mc_version}});
+        "version", {{"url", version_url}, {"versionId", instance_name}, {"actualVersionId", info.mc_version}});
     if (!version_result.value("ok", false)) {
         error = "获取 Minecraft 版本信息失败：" + version_result.value("error", std::string("未知错误"));
         return false;
@@ -1249,7 +1334,7 @@ inline bool ModpackService::InstallVanilla(const PackInfo& info, std::string& er
         nlohmann::json assets_result = download_.RunStep(
             "assets", {{"assetIndexUrl", version_result["assetIndex"].value("url", "")},
                        {"assetIndexId", version_result["assetIndex"].value("id", "")},
-                       {"profileName", info.mc_version}});
+                       {"profileName", instance_name}});
         if (!assets_result.value("ok", false)) {
             error = "下载游戏资源文件失败：" + assets_result.value("error", std::string("未知错误"));
             return false;
@@ -1283,7 +1368,7 @@ inline bool ModpackService::InstallVanilla(const PackInfo& info, std::string& er
         nlohmann::json client_result = download_.RunStep(
             "client", {{"url", version_result["clientDownload"].value("url", "")},
                        {"sha1", version_result["clientDownload"].value("sha1", "")},
-                       {"profileName", info.mc_version},
+                       {"profileName", instance_name},
                        {"actualVersionId", info.mc_version}});
         if (!client_result.value("ok", false)) {
             error = "下载游戏客户端失败：" + client_result.value("error", std::string("未知错误"));
@@ -1291,10 +1376,9 @@ inline bool ModpackService::InstallVanilla(const PackInfo& info, std::string& er
         }
     }
 
-    // 5) 登记进 config.json，主页/资源页才看得见这个版本
-    VersionService::SaveVersionEntry({{"profileName", info.mc_version},
-                                     {"actualVersionId", info.mc_version},
-                                     {"mainClass", version_result.value("mainClass", "")}});
+    // 原版不再作为独立版本登记：它只落在实例目录里，config.json 里不该出现一个
+    // 指向 versions\<mc版本>\ 的条目（那个目录可能压根没被我们创建过）。
+    // 实例自己会在 FinalizeInstance 里被扫描登记
 
     EmitProgress("vanilla", "游戏本体安装完成", PercentAt("vanilla", 100, 100));
     return true;
@@ -1326,7 +1410,8 @@ inline bool ModpackService::InstallLoader(const PackInfo& info, const std::strin
 }
 
 // ============================================================================
-// 收尾：建目录、打强制隔离标记、刷新版本列表
+// 收尾：把原版 JSON 和加载器 JSON 合并成单文件，清掉中间产物，
+//       打上强制隔离 / 派生版本标记，刷新版本列表
 // ============================================================================
 inline bool ModpackService::FinalizeInstance(const PackInfo& info, const std::string& instance_name,
                                              std::string& error) {
@@ -1341,48 +1426,46 @@ inline bool ModpackService::FinalizeInstance(const PackInfo& info, const std::st
         Core::FileManager::CreateDirRecursive(instance_dir + L"\\" + name);
     }
 
-    // 版本 JSON：加载器装过就有（带 inheritsFrom），纯原版整合包则没有。
-    // 无论如何这个文件都得存在，否则 GameLaunchService 读不到它，
-    // 隔离判定和加载器识别都会失效
-    const std::wstring version_json_path = instance_dir + L"\\" + Utf8ToWide(instance_name) + L".json";
-    nlohmann::json version_json = ReadJsonFile(version_json_path);
-    if (!version_json.is_object()) version_json = nlohmann::json::object();
-
-    // GameLaunchService 只从"当前版本 JSON"里取 mainClass，没有向 inheritsFrom
-    // 回退的逻辑。加载器装过的话 JSON 自带 mainClass，没问题；纯原版整合包
-    // （或者加载器没装成）就没有，得从刚下好的原版 JSON 里搬一份进来，
-    // 否则这个实例选中后根本起不来
-    const bool has_main_class = version_json.contains("mainClass") &&
-                                version_json["mainClass"].is_string() &&
-                                !version_json["mainClass"].get<std::string>().empty();
-    if (!has_main_class) {
-        // 原版装在自己的版本目录里（versions\<mc>\<mc>.json）；旧版本装的是
-        // 塞在实例目录内的那份，两种都试一下，保证老实例也能修好
-        nlohmann::json vanilla = ReadJsonFile(
-            MinecraftDir() + L"\\versions\\" + Utf8ToWide(info.mc_version) + L"\\" +
-            Utf8ToWide(info.mc_version) + L".json");
-        if (!vanilla.contains("mainClass")) {
-            vanilla = ReadJsonFile(instance_dir + L"\\" + Utf8ToWide(info.mc_version) + L".json");
-        }
-        if (!vanilla.contains("mainClass") || !vanilla["mainClass"].is_string()) {
-            error = "找不到原版版本信息，实例缺少启动主类，无法启动";
-            return false;
-        }
-        version_json["id"] = instance_name;
-        version_json["inheritsFrom"] = info.mc_version;
-        version_json["type"] = vanilla.value("type", "release");
-        version_json["mainClass"] = vanilla["mainClass"];
+    // 父版本：刚才下好的原版 JSON
+    const std::wstring vanilla_json_path =
+        instance_dir + L"\\" + Utf8ToWide(info.mc_version) + L".json";
+    const nlohmann::json parent = ReadJsonFile(vanilla_json_path);
+    if (!parent.contains("mainClass") || !parent["mainClass"].is_string()) {
+        error = "找不到原版版本信息，实例缺少启动主类，无法启动";
+        return false;
     }
+
+    // 子版本：加载器装过才有（纯原版整合包这里读出来是空 object）。
+    // 实例名不会等于游戏版本号（InstallWorkerImpl 里已经挡掉了），
+    // 所以这份 JSON 和上面那份不可能是同一个文件
+    const std::wstring version_json_path =
+        instance_dir + L"\\" + Utf8ToWide(instance_name) + L".json";
+    const nlohmann::json child = ReadJsonFile(version_json_path);
+
+    nlohmann::json merged = MergeVersionJson(parent, child);
+
+    // id 必须是真实的游戏版本号，不能用实例名：JavaService 按它推算需要哪个
+    // Java，GameLaunchService 按它判断 LWJGL 版本、要不要走加载器分支
+    merged["id"] = info.mc_version;
+    // PCL 用的同名字段，写上以后这个实例在 PCL 里也能被正确识别游戏版本
+    merged["clientVersion"] = info.mc_version;
+    // 合并后不再有 inheritsFrom，靠这个键告诉 GameLaunchService
+    // 「这是原版 + 加载器合成的版本」，加载器专属的启动参数才不会被跳过
+    if (!child.empty()) merged["__tauricppDerived"] = true;
     // 强制版本隔离：整合包实例必须独占自己的 mods / saves，
     // 不能指望用户把全局 versionIsolation 打开
-    version_json["__tauricppForceIsolation"] = true;
+    merged["__tauricppForceIsolation"] = true;
 
     if (!Core::FileManager::SaveFile(version_json_path,
-                                     version_json.dump(4, ' ', false,
-                                                       nlohmann::json::error_handler_t::replace))) {
+                                     merged.dump(4, ' ', false,
+                                                 nlohmann::json::error_handler_t::replace))) {
         error = "写入版本信息失败，目标目录可能被占用";
         return false;
     }
+
+    // 合并完就只剩一份 JSON，原版那份是中间产物，删掉。
+    // 留着的话版本目录里会有两个 json，版本列表和启动器可能各挑各的
+    DeleteFileW(vanilla_json_path.c_str());
 
     // 重新扫一遍 versions 目录，把新版本同步进 config.json
     VersionService::ScanInstalledVersions();
@@ -1415,7 +1498,8 @@ inline nlohmann::json ModpackService::HandleInspect(const nlohmann::json& args) 
         " mc=" + info.mc_version + " loader=" + info.loader_type + " " + info.loader_version +
         " files=" + std::to_string(info.declared_files));
 
-    // 实例名建议值：整合包自报的名字；同名已存在时自动加序号
+    // 实例名建议值：整合包自报的名字；同名已存在时自动加序号。
+    // 另外要避开游戏版本号本身 —— 那个名字会和原版 JSON 的中间产物重名
     std::string suggested = SanitizeInstanceName(info.name);
     if (suggested.empty()) suggested = "整合包";
     if (suggested.size() > 60) suggested.resize(60);
@@ -1423,7 +1507,10 @@ inline nlohmann::json ModpackService::HandleInspect(const nlohmann::json& args) 
     const std::wstring versions_dir = MinecraftDir() + L"\\versions";
     std::string candidate = suggested;
     for (int suffix = 2; suffix < 1000; suffix++) {
-        if (!Core::FileManager::FileExists(versions_dir + L"\\" + Utf8ToWide(candidate))) break;
+        if (candidate != info.mc_version &&
+            !Core::FileManager::FileExists(versions_dir + L"\\" + Utf8ToWide(candidate))) {
+            break;
+        }
         candidate = suggested + " (" + std::to_string(suffix) + ")";
     }
 
@@ -1537,6 +1624,14 @@ inline void ModpackService::InstallWorkerImpl(const nlohmann::json& args) {
         return;
     }
 
+    // 实例名不能和游戏版本号撞车：原版 JSON 的中间产物叫 <mc版本>.json，
+    // 加载器 JSON 叫 <实例名>.json，两者同名时加载器会把原版那份覆盖掉，
+    // 合并阶段就只剩半个版本，装出来启动不了
+    if (instance_name == info.mc_version) {
+        fail("实例名不能和游戏版本号相同（" + info.mc_version + "），请换一个名字");
+        return;
+    }
+
     // 有文件被作者删掉了：这些没法反推地址，缺失可能导致整合包出问题，
     // 所以像 PCL 那样让用户自己决定继续还是取消（对应 ModModpack.vb:256）
     if (!info.missing_files.empty()) {
@@ -1580,7 +1675,7 @@ inline void ModpackService::InstallWorkerImpl(const nlohmann::json& args) {
         return;
     }
 
-    if (!InstallVanilla(info, error)) {
+    if (!InstallVanilla(info, instance_name, error)) {
         Core::FileManager::RemoveDirectoryRecursive(instance_dir);
         fail(error);
         return;

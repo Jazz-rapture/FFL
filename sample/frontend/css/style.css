@@ -1907,6 +1907,90 @@ body {
   background: rgba(0, 212, 255, 0.78);
 }
 
+/* ---- 副导航栏：实例分层形态（游戏设置 / 模组 / 资源包 / 光影包）----
+   四个分类在上，「返回」沉到栏底：它不属于分类，混在列表里容易被误点 */
+.sub-sidebar.is-instance .sub-sidebar-item[data-tab="back"] {
+  margin-top: auto;
+  color: var(--text-muted);
+  border-top: 1px solid var(--glass-row-border);
+  border-radius: 0;
+  padding-top: 14px;
+  width: 100%;
+}
+
+.sub-sidebar.is-instance .sub-sidebar-item[data-tab="back"]:hover {
+  color: var(--text-strong);
+  background: transparent;
+}
+
+/* ---- 实例页小标题条：左边版本名，右边当前分类 ---- */
+.resource-instance-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 4px 10px;
+}
+
+.resource-instance-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-instance-tab {
+  flex-shrink: 0;
+  font-size: 12px;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+
+/* ---- 实例页的文件列表（模组 / 资源包 / 光影包）---- */
+.resource-file-summary {
+  padding: 0 4px 8px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.resource-file-list {
+  /* 列表本身不滚动：滚动交给整块内容面板，滚动条才不会贴着列表边缘出现两条 */
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- 展示区与副导航栏联动的换内容 ----
+   进 / 出实例时内容跟着导航一起退场进场：退场只给 0.16s，比导航的滑出快，
+   换 DOM 的那一刻它已经完全透明，看不出硬切；进场沿用面板自己的 0.3s，
+   再叠上下面那层逐行错峰。选择器必须压过 .resource-page.active .resource-content
+   的 opacity: 1，否则这条不生效 */
+.resource-page.active .resource-content.is-swapping {
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.16s ease-in, transform 0.16s ease-in;
+}
+
+.resource-content {
+  /* 面板本来只过渡 opacity，补上位移，退场进场才不会跳一下 */
+  transition: opacity 0.3s var(--ease-out), transform 0.3s var(--ease-out);
+}
+
+/* 内容里的行也错峰浮入：面板挂的 .stagger-in 只作用于直接子元素（就一个
+   .settings-section），不补这层的话整块只会淡一次，跟导航的进场节奏对不上。
+   注意只到 .settings-section 的直接子元素为止 —— 几百个 mod 行在更里层，
+   给它们逐个加延迟会变成一片乱闪 */
+.resource-content.stagger-in .settings-section > * {
+  animation: reveal-in 0.26s var(--ease-out) backwards;
+}
+
+.resource-content.stagger-in .settings-section > *:nth-child(2) { animation-delay: 0.04s; }
+.resource-content.stagger-in .settings-section > *:nth-child(3) { animation-delay: 0.08s; }
+.resource-content.stagger-in .settings-section > *:nth-child(4) { animation-delay: 0.12s; }
+.resource-content.stagger-in .settings-section > *:nth-child(5) { animation-delay: 0.16s; }
+.resource-content.stagger-in .settings-section > *:nth-child(n+6) { animation-delay: 0.2s; }
+
 /* ---- 资源管理页容器 ---- */
 .resource-page {
   position: fixed;
@@ -3147,6 +3231,8 @@ body {
   border: 2px dashed var(--accent);
   border-radius: var(--glass-radius);
   background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-shadow);
 }
 
@@ -3194,6 +3280,255 @@ body {
   color: var(--text-muted);
 }
 
+/* ---- 背景选择卡片 ---- */
+/* 和安装确认卡片同一套材质，只是里面是缩略图网格 */
+.bg-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 380;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 14, 30, 0.26);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  animation: drop-overlay-in 0.16s var(--ease-out);
+}
+
+.bg-mask[hidden] {
+  display: none;
+}
+
+.bg-dialog {
+  width: 460px;
+  max-height: 82vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shadow);
+  color: var(--text);
+}
+
+/* 卡片区域自己滚，底部操作栏固定 —— 自定义图再多也不会把「完成」顶出去 */
+.bg-dialog-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-right: 4px;
+}
+
+.bg-dialog-footer {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.bg-dialog-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.bg-dialog-sub,
+.bg-dialog-hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.bg-dialog-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 36px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.bg-section-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: -4px;
+}
+
+.bg-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.bg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.15s;
+}
+
+.bg-card:hover {
+  background: var(--glass-row-hover);
+  transform: translateY(-1px);
+}
+
+/* 当前使用中的那张：描一圈主色边，和普通卡片区分开 */
+.bg-card.is-active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.bg-card-thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-sm);
+  background-color: rgba(255, 255, 255, 0.06);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.bg-card-name {
+  font-size: 12px;
+  color: var(--text);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bg-empty {
+  padding: 16px 14px;
+  border: 1px dashed var(--glass-row-border);
+  border-radius: var(--radius-lg);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.bg-folder-row {
+  display: flex;
+  gap: 8px;
+}
+
+.bg-btn {
+  flex: 1;
+  height: 38px;
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--radius-xl);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  transition: background 0.2s, transform 0.15s;
+}
+
+.bg-btn:hover {
+  background: var(--accent-hover);
+}
+
+.bg-btn:active {
+  transform: scale(0.98);
+}
+
+.bg-btn.is-secondary {
+  background: var(--glass-row);
+  border: 1px solid var(--glass-row-border);
+  color: var(--text);
+  font-weight: 500;
+}
+
+.bg-btn.is-secondary:hover {
+  background: var(--glass-row-hover);
+}
+
+/* ---- 换底图：过渡层 + 全局退场 ---- */
+/* 新底图的过渡层。body 的背景会传播成画布底色（html 没有自己的背景），
+   所以负 z-index 的定位元素正好压在它上面、所有内容下面，只负责把新图淡进来。
+   新图完全盖住旧图之后才去改 --bg-image，切图那一帧用户是看不见的 */
+.bg-fade {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-size: cover;
+  background-position: center center;
+  background-repeat: no-repeat;
+  opacity: 0;
+  transition: opacity 0.44s var(--ease-out);
+}
+
+.bg-fade.is-visible {
+  opacity: 1;
+}
+
+/* 背板模糊层：盖在所有界面之上（pointer-events 关掉，不挡操作），
+   backdrop-filter 会把它下面的一切一起柔化 —— 里面的底图、过渡层，还有界面本身。
+   所以退场时 UI 是"化进模糊里"，进场时 UI 是从模糊里对焦回来的，
+   而不是背景变清晰、UI 却已经硬邦邦地立在那儿。
+   最模糊时正好等于玻璃材质那一档（--glass-blur）：收模糊的过程中，
+   玻璃面板自己的 backdrop 模糊留在原地，全局模糊和面板玻璃就在这一步完成交接。
+   静息态用 display:none 完全剔除，否则一层全屏 backdrop 会常态占用合成开销 */
+.bg-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: none;
+  pointer-events: none;
+  backdrop-filter: blur(0px);
+  -webkit-backdrop-filter: blur(0px);
+  transition: backdrop-filter 0.38s var(--ease-out), -webkit-backdrop-filter 0.38s var(--ease-out);
+}
+
+.bg-veil.is-active {
+  display: block;
+}
+
+.bg-veil.is-blurred {
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+/* 过渡期间所有界面退场：看得见的变化交给 .is-bg-fading 的透明度过渡，
+   .is-bg-receded 负责隐藏，.is-bg-locked 负责整段过渡期间挡住点击。
+   拆开是因为"看得见"和"点得动"的起止时刻不一样：界面在收模糊之前就已经
+   回来了（否则会先出现一帧全屏清晰），但点击要等整段过渡结束才放开。
+   两个背景辅助层（过渡层 / 模糊层）必须排除，它们不是界面 */
+body.is-bg-fading > *:not(.bg-fade):not(.bg-veil) {
+  transition: opacity 0.32s var(--ease-out) !important;
+}
+
+body.is-bg-receded > *:not(.bg-fade):not(.bg-veil) {
+  opacity: 0;
+}
+
+body.is-bg-locked > *:not(.bg-fade):not(.bg-veil) {
+  pointer-events: none;
+}
+
 /* ---- 安装确认卡片 ---- */
 .modpack-mask {
   position: fixed;
@@ -3202,7 +3537,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(10, 14, 30, 0.5);
+  background: rgba(10, 14, 30, 0.26);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
   animation: drop-overlay-in 0.16s var(--ease-out);
@@ -3220,7 +3555,9 @@ body {
   flex-direction: column;
   gap: var(--space-3);
   padding: var(--space-4);
-  background: rgba(24, 28, 48, 0.92);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 1px solid var(--glass-border);
   border-radius: var(--glass-radius);
   box-shadow: var(--glass-shadow);
@@ -3621,49 +3958,14 @@ body.is-tasks-page .notification-card[data-tag="download"] {
   flex: 1;
 }
 
-/* ---- 版本管理：mod 列表折叠 ---- */
-/* 整合包动辄几百个 mod，默认只列前几个，其余收进这里 */
-.mod-fold {
-  margin-bottom: 6px;
-}
-
-.mod-fold-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
+/* 共用提示行：版本隔离未开启之类的说明，横在文件列表上面 */
+.settings-item-hint {
   padding: 10px 14px;
-  background: transparent;
-  border: 1px dashed var(--glass-row-border);
+  margin-bottom: 8px;
+  background: rgba(255, 200, 0, 0.12);
+  border: 1px solid rgba(255, 200, 0, 0.28);
   border-radius: var(--radius-lg);
-  color: var(--text-muted);
   font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-
-.mod-fold-toggle:hover {
-  background: var(--glass-row);
-  color: var(--text);
-  border-color: var(--glass-border);
-}
-
-.mod-fold.is-open .mod-fold-toggle {
-  color: var(--text);
-  border-style: solid;
-}
-
-.mod-fold-arrow {
-  font-size: 10px;
-  color: var(--text-faint);
-}
-
-.mod-fold-panel {
-  /* 展开后和上面的 mod 行之间留一点呼吸 */
-  margin-top: 6px;
-  animation: reveal-in 0.2s var(--ease-out);
-}
-
-.mod-fold-panel[hidden] {
-  display: none;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.78);
 }

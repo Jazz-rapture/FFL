@@ -141,12 +141,13 @@ private:
             return GetResourcePaths();
         });
 
-        // game.listMods - 某个版本 mods 文件夹里的所有 mod 与启用状态
+        // game.listMods - 某个版本下某个目录里的文件与启用状态。
+        // category 取 mods / resourcepacks / shaderpacks，缺省按 mods
         bridge_.RegisterCommand("game.listMods", [](const nlohmann::json& args) -> nlohmann::json {
             return HandleListMods(args);
         });
 
-        // game.toggleMod - 启用/停用某个 mod（改扩展名）
+        // game.toggleMod - 启用/停用某个文件（改扩展名），category 同上
         bridge_.RegisterCommand("game.toggleMod", [](const nlohmann::json& args) -> nlohmann::json {
             return HandleToggleMod(args);
         });
@@ -701,10 +702,23 @@ private:
         }
     }
 
-    // 带 inheritsFrom 的版本 JSON 就是模组加载器版本（Forge / Fabric / Quilt / NeoForge）
+    // 整合包安装出来的实例会被静态合并成单文件版本 JSON（对齐 PCL 的 MergeJson），
+    // 里面没有 inheritsFrom。安装器会在合并结果里打上这个键，说明「这份 JSON 是
+    // 原版 + 加载器合成出来的」，否则加载器分支（classpath 去重、加载器专属
+    // JVM 参数、自动内存）会因为找不到 inheritsFrom 而整段跳过，Forge / Fabric
+    // 直接起不来。手工安装的加载器版本仍然带 inheritsFrom，两种都要认。
+    static constexpr const char* kDerivedKey = "__tauricppDerived";
+
+    // 带 inheritsFrom 或带合并标记的版本 JSON，就是模组加载器版本
+    // （Forge / NeoForge / Fabric / Quilt）
+    static bool IsDerivedProfileJson(const nlohmann::json& versionJson) {
+        if (versionJson.contains("inheritsFrom") && versionJson["inheritsFrom"].is_string()) return true;
+        return versionJson.contains(kDerivedKey) && versionJson[kDerivedKey].is_boolean() &&
+               versionJson[kDerivedKey].get<bool>();
+    }
+
     static bool IsModdedProfile(const std::string& profileName) {
-        nlohmann::json vj = ReadVersionJson(profileName);
-        return vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string();
+        return IsDerivedProfileJson(ReadVersionJson(profileName));
     }
 
     // 整合包实例强制版本隔离的标记键。
@@ -756,7 +770,7 @@ private:
 
         std::wstring versionDir = minecraftDir + L"\\versions\\" + Core::StringUtils::Utf8ToWide(profileName);
         nlohmann::json vj = ReadVersionJson(profileName);
-        const bool modded = vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string();
+        const bool modded = IsDerivedProfileJson(vj);
         return (ShouldIsolateVersion(settings.versionIsolation, modded) || IsForceIsolated(vj))
                    ? versionDir : minecraftDir;
     }
@@ -773,19 +787,45 @@ private:
         gameDir = ResolveGameDirForVersion(profileName, settings);
     }
 
-    // 列出某个版本 mods 文件夹里的所有 mod 与启用状态。
-    // 停用的 mod 是把扩展名换成 .disabled（加载器只认 .jar，改掉就不会被读）
+    // ==================== 版本文件管理（模组 / 资源包 / 光影包） ====================
+
+    // 前端三个分页各自对应的目录名。未知值一律当 mods —— 这个参数来自前端，
+    // 拼进路径之前必须先归一化，不能直接拿它当目录名用
+    static std::wstring ContentFolder(const std::string& category) {
+        if (category == "resourcepacks") return L"resourcepacks";
+        if (category == "shaderpacks") return L"shaderpacks";
+        return L"mods";
+    }
+
+    static bool EndsWithStr(const std::string& lower, const std::string& suffix) {
+        return lower.size() > suffix.size() &&
+               lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    // 每个目录里算「可管理文件」的扩展名。资源包 / 光影包只认 .zip，
+    // 模组除了 .jar 还有整合包偶尔塞的 .zip 和 LiteLoader 的 .litemod
+    static bool IsContentFile(const std::string& lowerBase, const std::string& category) {
+        if (category == "resourcepacks" || category == "shaderpacks") {
+            return EndsWithStr(lowerBase, ".zip");
+        }
+        return EndsWithStr(lowerBase, ".jar") || EndsWithStr(lowerBase, ".zip") ||
+               EndsWithStr(lowerBase, ".litemod");
+    }
+
+    // 列出某个版本某个目录里的文件与启用状态。
+    // 停用的文件是把扩展名换成 .disabled（加载器只认原扩展名，改掉就不会被读）
     static nlohmann::json HandleListMods(const nlohmann::json& args) {
         std::string profileName = args.value("version", "");
         if (profileName.empty()) return {{"ok", false}, {"error", "Missing version"}};
+        const std::string category = args.value("category", "mods");
 
         GameSettings settings = ReadGameSettings(ReadConfig());
         std::wstring gameDir = ResolveGameDirForVersion(profileName, settings);
-        std::wstring modsDir = gameDir + L"\\mods";
+        std::wstring dir = gameDir + L"\\" + ContentFolder(category);
 
-        nlohmann::json mods = nlohmann::json::array();
+        nlohmann::json files = nlohmann::json::array();
         WIN32_FIND_DATAW findData;
-        HANDLE hFind = FindFirstFileW((modsDir + L"\\*").c_str(), &findData);
+        HANDLE hFind = FindFirstFileW((dir + L"\\*").c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
                 if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -793,22 +833,14 @@ private:
 
                 std::string lower = name;
                 for (auto& c : lower) c = (char)tolower(c);
-                // 先把停用后缀剥掉再判扩展名，"xxx.jar.disabled" 也算 mod 文件
-                bool disabled = lower.size() >= 9 &&
-                    lower.compare(lower.size() - 9, 9, ".disabled") == 0;
-                std::string base = disabled ? lower.substr(0, lower.size() - 9) : lower;
-
-                auto endsWith = [](const std::string& s, const std::string& suffix) {
-                    return s.size() > suffix.size() &&
-                           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
-                };
-                if (!endsWith(base, ".jar") && !endsWith(base, ".zip") && !endsWith(base, ".litemod")) {
-                    continue;
-                }
+                // 先把停用后缀剥掉再判扩展名，"xxx.jar.disabled" 也算可管理文件
+                const bool disabled = EndsWithStr(lower, ".disabled");
+                const std::string base = disabled ? lower.substr(0, lower.size() - 9) : lower;
+                if (!IsContentFile(base, category)) continue;
 
                 long long size = ((long long)findData.nFileSizeHigh << 32) | findData.nFileSizeLow;
                 std::string enabledName = disabled ? name.substr(0, name.size() - 9) : name;
-                mods.push_back({
+                files.push_back({
                     {"name", name},
                     {"enabledName", enabledName},
                     {"enabled", !disabled},
@@ -820,9 +852,9 @@ private:
 
         return {
             {"ok", true},
-            {"mods", mods},
-            {"modsDir", Core::StringUtils::WideToUtf8(modsDir)},
-            // 没开隔离时多个版本共用同一个 .minecraft\mods，界面要能说清楚这一点
+            {"files", files},
+            {"dir", Core::StringUtils::WideToUtf8(dir)},
+            // 没开隔离时多个版本共用同一个 .minecraft\xxx，界面要能说清楚这一点
             {"shared", gameDir == (Core::FileManager::GetExeDir() + L"\\.minecraft")}
         };
     }
@@ -833,10 +865,12 @@ private:
         std::string name = args.value("name", "");
         bool enable = args.value("enable", true);
         if (profileName.empty() || name.empty()) return {{"ok", false}, {"error", "Missing version or name"}};
+        const std::string category = args.value("category", "mods");
 
         GameSettings settings = ReadGameSettings(ReadConfig());
-        std::wstring modsDir = ResolveGameDirForVersion(profileName, settings) + L"\\mods";
-        std::wstring from = modsDir + L"\\" + Core::StringUtils::Utf8ToWide(name);
+        std::wstring dir = ResolveGameDirForVersion(profileName, settings) + L"\\" +
+                           ContentFolder(category);
+        std::wstring from = dir + L"\\" + Core::StringUtils::Utf8ToWide(name);
 
         const std::wstring suffix = L".disabled";
         bool currentlyDisabled = from.size() > suffix.size() &&
@@ -852,7 +886,7 @@ private:
         }
 
         if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            return {{"ok", false}, {"error", "Mod 文件不存在，可能已被移动或删除"}};
+            return {{"ok", false}, {"error", "文件不存在，可能已被移动或删除"}};
         }
         // 目标已存在就先删掉，否则 MoveFileW 会失败（例如 .disabled 和 .jar 同时存在）
         if (GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES) {
@@ -1815,13 +1849,15 @@ private:
             classpathStr += classpath[i];
         }
 
-        // 带 inheritsFrom 的版本 JSON 说明这是模组加载器版本（Forge / Fabric / Quilt / NeoForge）。
-        // 它们的 launch 完全依赖自己声明的 arguments.jvm（--module-path / -DignoreList /
-        // -DlibraryDirectory / -DFabricMcEmu 等）。原版版本 JSON 没有 inheritsFrom，
-        // 因此下面的加载器分支不会影响任何现有原版启动流程。
-        bool isDerivedVersion = vj.contains("inheritsFrom") && vj["inheritsFrom"].is_string();
+        // 带 inheritsFrom 或合并标记的版本 JSON 说明这是模组加载器版本（Forge / Fabric /
+        // Quilt / NeoForge）。它们的 launch 完全依赖自己声明的 arguments.jvm
+        // （--module-path / -DignoreList / -DlibraryDirectory / -DFabricMcEmu 等）。
+        // 纯原版版本 JSON 两样都没有，因此下面的加载器分支不会影响原版启动流程。
+        bool isDerivedVersion = IsDerivedProfileJson(vj);
         if (isDerivedVersion) {
-            WriteLaunchLog("检测到模组加载器版本, 继承自: " + vj.value("inheritsFrom", std::string()));
+            WriteLaunchLog("检测到模组加载器版本, 继承自: " +
+                           (vj.contains("inheritsFrom") ? vj.value("inheritsFrom", std::string())
+                                                        : std::string("(已合并)")));
         }
 
         GameSettings settings = ReadGameSettings(config);
