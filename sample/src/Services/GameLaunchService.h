@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <atomic>
 #include <mutex>
 #include <sstream>
 #include <cmath>
@@ -173,6 +174,409 @@ private:
             g_app_ptr->GetBridge().Emit("game.launch.notice",
                                         {{"title", title}, {"content", content}, {"type", type}});
         } catch (...) {}
+    }
+
+    // ==================== 缺失文件自动补齐 ====================
+
+    // 一个待补文件：落盘位置 + 候选下载地址 + 期望的 SHA-1
+    struct RepairItem {
+        std::wstring path;
+        std::vector<std::string> urls;
+        std::string sha1;
+        std::string name;    // 日志和提示里显示的名字
+        // 资源对象（贴图 / 音效）缺了不致命：游戏照样起得来，只是贴图变默认。
+        // 库、natives、核心 jar 缺了根本启动不了
+        bool fatal = true;
+    };
+
+    // 补齐进度：前端拿它更新按钮上的"补齐文件 3/37"
+    void EmitRepairProgress(int done, int total) {
+        if (!g_app_ptr) return;
+        try {
+            g_app_ptr->GetBridge().Emit("game.launch.progress",
+                                        {{"phase", "launch"}, {"status", "repairing"},
+                                         {"done", done}, {"total", total}});
+        } catch (...) {}
+    }
+
+    // 并发补齐：每个文件按候选地址逐个试，落盘前校验 SHA-1。
+    // 返回补成功的数量，失败项追加进 failures
+    int RepairMissingFiles(std::vector<RepairItem> items, std::vector<RepairItem>& failures) {
+        const int total = static_cast<int>(items.size());
+        if (total == 0) return 0;
+
+        int threadCount = 8;
+        try {
+            nlohmann::json config = nlohmann::json::parse(Core::ConfigManager::ReadConfigFile());
+            if (config.contains("downloadThreads") && config["downloadThreads"].is_number_integer()) {
+                threadCount = config["downloadThreads"].get<int>();
+            }
+        } catch (...) {}
+        threadCount = (std::max)(1, (std::min)(threadCount, 16));
+        threadCount = (std::min)(threadCount, total);
+
+        std::atomic<int> next{0};
+        std::atomic<int> done{0};
+        std::atomic<int> repaired{0};
+        std::mutex resultMtx;
+
+        auto worker = [&]() {
+            for (;;) {
+                const int index = next.fetch_add(1);
+                if (index >= total) return;
+                RepairItem& item = items[static_cast<size_t>(index)];
+
+                // 目录可能整个还不存在（比如 assets\objects\ab）
+                const size_t slash = item.path.find_last_of(L'\\');
+                if (slash != std::wstring::npos) {
+                    Core::FileManager::CreateDirRecursive(item.path.substr(0, slash));
+                }
+
+                bool ok = false;
+                for (const auto& url : item.urls) {
+                    if (url.empty()) continue;
+                    Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(url));
+                    if (res.status != 200 || res.body.empty()) continue;
+                    // 有 SHA-1 就必须对得上：宁可报缺失，也不要落一个坏文件进 libraries
+                    if (!item.sha1.empty() &&
+                        Core::HashUtils::ComputeSHA1(res.body) != item.sha1) {
+                        continue;
+                    }
+                    if (!Core::FileManager::SaveFile(item.path, res.body)) continue;
+                    ok = true;
+                    break;
+                }
+
+                if (ok) {
+                    repaired.fetch_add(1);
+                } else {
+                    std::lock_guard<std::mutex> lock(resultMtx);
+                    failures.push_back(item);
+                }
+
+                const int finished = done.fetch_add(1) + 1;
+                // 进度节流：资源对象动辄上千个，逐个发事件会把 JS 队列刷爆。
+                // 最多发 50 次，最后一个一定发（保证能看到走完）
+                const int step = (std::max)(1, total / 50);
+                if (finished == total || finished % step == 0) {
+                    EmitRepairProgress(finished, total);
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<size_t>(threadCount));
+        for (int i = 0; i < threadCount; i++) threads.emplace_back(worker);
+        for (auto& t : threads) t.join();
+
+        return repaired.load();
+    }
+
+    // 扫描一遍缺失文件，把每一项的落盘路径和候选下载地址一起收出来。
+    // 地址先用版本 JSON 里给的，再补上镜像规则推出的做兜底
+    void ScanMissingFiles(const nlohmann::json& mergedLibs, const nlohmann::json& config,
+                          const std::wstring& libsBase, const std::wstring& versionJar,
+                          const std::wstring& indexesDir, const std::wstring& objectsDir,
+                          const nlohmann::json& vj, const nlohmann::json& parentVj,
+                          const nlohmann::json& assetIndexObj,
+                          std::vector<RepairItem>& out, std::vector<std::string>& names) {
+        auto addUrl = [](RepairItem& item, const std::string& url) {
+            if (url.empty()) return;
+            for (const auto& existing : item.urls) {
+                if (existing == url) return;
+            }
+            item.urls.push_back(url);
+        };
+
+        // ---- 依赖库 ----
+        for (const auto& lib : mergedLibs) {
+            const std::string name = lib.value("name", "");
+            if (!MavenUtils::CheckRulesMatch(lib)) continue;
+            if (MavenUtils::IsLibraryIgnored(name, config)) continue;
+
+            Models::MavenCoord coord = MavenUtils::ParseMavenName(name);
+            if (coord.groupId.empty() || coord.artifactId.empty() || coord.version.empty()) continue;
+
+            const bool isNativeJar = !coord.classifier.empty() &&
+                                     (coord.classifier.find("natives") != std::string::npos);
+
+            std::string mavenPath = MavenUtils::BuildMavenPath(coord);
+            std::string downloadUrl;
+            std::string sha1;
+
+            if (lib.contains("downloads") && lib["downloads"].is_object()) {
+                if (isNativeJar && lib["downloads"].contains("classifiers") &&
+                    lib["downloads"]["classifiers"].is_object() &&
+                    lib["downloads"]["classifiers"].contains(coord.classifier)) {
+                    const auto& info = lib["downloads"]["classifiers"][coord.classifier];
+                    downloadUrl = info.value("url", "");
+                    sha1 = info.value("sha1", "");
+                    if (info.contains("path")) mavenPath = info["path"].get<std::string>();
+                } else if (!isNativeJar && lib["downloads"].contains("artifact") &&
+                           lib["downloads"]["artifact"].is_object()) {
+                    const auto& artifact = lib["downloads"]["artifact"];
+                    downloadUrl = artifact.value("url", "");
+                    sha1 = artifact.value("sha1", "");
+                    if (artifact.contains("path")) mavenPath = artifact["path"].get<std::string>();
+                }
+            }
+
+            const bool isForgeDep = (mavenPath.find("net/minecraftforge/") != std::string::npos) ||
+                                    (downloadUrl.find("maven.minecraftforge.net") != std::string::npos);
+
+            std::string localPath = mavenPath;
+            std::replace(localPath.begin(), localPath.end(), '/', '\\');
+            const std::wstring jarPath = libsBase + L"\\" + Core::StringUtils::Utf8ToWide(localPath);
+
+            // 存在但 SHA-1 对不上也算缺：补齐流程会把坏文件覆盖掉
+            bool missing = (GetFileAttributesW(jarPath.c_str()) == INVALID_FILE_ATTRIBUTES);
+            if (!missing && !sha1.empty() &&
+                Core::HashUtils::ComputeFileSHA1(jarPath) != sha1) {
+                WriteLaunchLog("损坏: " + name + "（SHA-1 不符，重新补齐）");
+                missing = true;
+            }
+
+            if (missing) {
+                RepairItem item;
+                item.path = jarPath;
+                item.sha1 = sha1;
+                item.name = name;
+                item.fatal = true;
+                addUrl(item, downloadUrl);
+                if (downloadUrl.empty() && lib.contains("url") && lib["url"].is_string()) {
+                    std::string baseUrl = lib["url"].get<std::string>();
+                    if (!baseUrl.empty() && baseUrl.back() != '/') baseUrl += '/';
+                    addUrl(item, baseUrl + mavenPath);
+                }
+                // 镜像兜底：官方 maven + BMCLAPI / qlu
+                const auto mirrors = isForgeDep
+                    ? Core::DownloadSourceManager::GetForgeDownloadUrls(mavenPath)
+                    : Core::DownloadSourceManager::GetLibraryMirrorUrls(mavenPath);
+                for (const auto& url : mirrors) addUrl(item, url);
+
+                names.push_back(name);
+                out.push_back(std::move(item));
+            }
+
+            // ---- natives 分类器 jar ----
+            if (isNativeJar) continue;
+            if (!lib.contains("natives") || !lib["natives"].is_object()) continue;
+            if (!lib.contains("downloads") || !lib["downloads"].is_object()) continue;
+            if (!lib["downloads"].contains("classifiers") || !lib["downloads"]["classifiers"].is_object()) continue;
+
+            std::string classifierKey;
+#if defined(_WIN32)
+            if (lib["natives"].contains("windows")) classifierKey = lib["natives"]["windows"].get<std::string>();
+#elif defined(__APPLE__)
+            if (lib["natives"].contains("osx")) classifierKey = lib["natives"]["osx"].get<std::string>();
+#else
+            if (lib["natives"].contains("linux")) classifierKey = lib["natives"]["linux"].get<std::string>();
+#endif
+            if (classifierKey.empty() || !lib["downloads"]["classifiers"].contains(classifierKey)) continue;
+
+            const auto& ci = lib["downloads"]["classifiers"][classifierKey];
+            const std::string nativeUrl = ci.value("url", "");
+            const std::string nativeSha1 = ci.value("sha1", "");
+            std::string nativePath = ci.value("path", "");
+            if (nativePath.empty()) {
+                nativePath = MavenUtils::BuildMavenPath(coord);
+                const size_t lastSlash = nativePath.find_last_of('/');
+                if (lastSlash == std::string::npos) continue;
+                std::string classifier = classifierKey;
+                const size_t archPos = classifier.find("${arch}");
+                if (archPos != std::string::npos) classifier.replace(archPos, 7, "64");
+                nativePath = nativePath.substr(0, lastSlash + 1) + coord.artifactId + "-" +
+                             coord.version + "-" + classifier + ".jar";
+            }
+
+            std::string localNativePath = nativePath;
+            std::replace(localNativePath.begin(), localNativePath.end(), '/', '\\');
+            const std::wstring nativeJarPath =
+                libsBase + L"\\" + Core::StringUtils::Utf8ToWide(localNativePath);
+
+            bool nativeMissing = (GetFileAttributesW(nativeJarPath.c_str()) == INVALID_FILE_ATTRIBUTES);
+            if (!nativeMissing && !nativeSha1.empty() &&
+                Core::HashUtils::ComputeFileSHA1(nativeJarPath) != nativeSha1) {
+                nativeMissing = true;
+            }
+            if (!nativeMissing) continue;
+
+            RepairItem nativeItem;
+            nativeItem.path = nativeJarPath;
+            nativeItem.sha1 = nativeSha1;
+            nativeItem.name = name + " (natives)";
+            nativeItem.fatal = true;
+            addUrl(nativeItem, nativeUrl);
+            for (const auto& url : Core::DownloadSourceManager::GetLibraryMirrorUrls(nativePath)) {
+                addUrl(nativeItem, url);
+            }
+            names.push_back(nativeItem.name);
+            out.push_back(std::move(nativeItem));
+        }
+
+        // ---- 游戏核心 jar ----
+        if (GetFileAttributesW(versionJar.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            RepairItem item;
+            item.path = versionJar;
+            item.name = Core::StringUtils::WideToUtf8(versionJar);
+            item.fatal = true;
+            // 加载器版本自己没有 downloads.client，取继承的原版那份
+            nlohmann::json client;
+            if (vj.contains("downloads") && vj["downloads"].is_object() &&
+                vj["downloads"].contains("client")) {
+                client = vj["downloads"]["client"];
+            } else if (parentVj.contains("downloads") && parentVj["downloads"].is_object() &&
+                       parentVj["downloads"].contains("client")) {
+                client = parentVj["downloads"]["client"];
+            }
+            if (client.is_object()) {
+                addUrl(item, client.value("url", ""));
+                item.sha1 = client.value("sha1", "");
+            }
+            names.push_back(item.name);
+            out.push_back(std::move(item));
+        }
+
+        // ---- 资源索引与资源对象 ----
+        const std::string assetIndexId = assetIndexObj.value("id", "");
+        if (assetIndexId.empty()) return;
+
+        const std::wstring indexPath =
+            indexesDir + L"\\" + Core::StringUtils::Utf8ToWide(assetIndexId) + L".json";
+        if (GetFileAttributesW(indexPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            RepairItem item;
+            item.path = indexPath;
+            item.name = "assets/indexes/" + assetIndexId + ".json";
+            item.fatal = true;
+            addUrl(item, assetIndexObj.value("url", ""));
+            item.sha1 = assetIndexObj.value("sha1", "");
+            names.push_back(item.name);
+            out.push_back(std::move(item));
+            // 索引不在就枚举不了对象，这一轮到此为止，下一轮再查
+            return;
+        }
+
+        std::ifstream indexFile(indexPath);
+        if (!indexFile.is_open()) return;
+        nlohmann::json assetIndex;
+        try {
+            indexFile >> assetIndex;
+        } catch (...) {
+            WriteLaunchLog("警告: 资源索引解析失败，跳过资源对象检查");
+            return;
+        }
+        if (!assetIndex.contains("objects") || !assetIndex["objects"].is_object()) return;
+
+        int missingObjects = 0;
+        for (const auto& entry : assetIndex["objects"].items()) {
+            if (!entry.value().is_object() || !entry.value().contains("hash")) continue;
+            const std::string hash = entry.value()["hash"].get<std::string>();
+            if (hash.size() < 2) continue;
+
+            const std::string prefix = hash.substr(0, 2);
+            const std::wstring objPath = objectsDir + L"\\" + Core::StringUtils::Utf8ToWide(prefix) +
+                                         L"\\" + Core::StringUtils::Utf8ToWide(hash);
+            if (GetFileAttributesW(objPath.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+
+            missingObjects++;
+            RepairItem item;
+            item.path = objPath;
+            item.sha1 = hash;
+            item.name = "assets/objects/" + prefix + "/" + hash;
+            // 资源对象缺了游戏照样能起（贴图退回默认），所以不是致命项
+            item.fatal = false;
+            for (const auto& url : Core::DownloadSourceManager::GetAssetsDownloadUrls(prefix, hash)) {
+                addUrl(item, url);
+            }
+            // 名字只留前 20 条：动辄上千个，逐条塞进日志和提示会把两边都撑爆
+            if (missingObjects <= 20) names.push_back(item.name);
+            out.push_back(std::move(item));
+        }
+        WriteLaunchLog("资源对象缺失: " + std::to_string(missingObjects) + " 个");
+    }
+
+    // 校验 + 自动补齐。返回 true 表示可以继续启动。
+    // 补不上时：库 / natives / 核心 jar 缺失拒绝启动，只有资源对象缺失才放行
+    bool EnsureGameFiles(const nlohmann::json& mergedLibs, const nlohmann::json& config,
+                         const std::wstring& minecraftDir, const std::wstring& versionJar,
+                         const nlohmann::json& vj, const nlohmann::json& parentVj,
+                         const nlohmann::json& assetIndexObj,
+                         std::string& error, nlohmann::json& missingOut) {
+        const std::wstring libsBase = minecraftDir + L"\\libraries";
+        const std::wstring indexesDir = minecraftDir + L"\\assets\\indexes";
+        const std::wstring objectsDir = minecraftDir + L"\\assets\\objects";
+
+        std::vector<RepairItem> missing;
+        std::vector<std::string> missingNames;
+        bool announced = false;
+
+        // 最多补两轮。第一轮很可能只是把资源索引补上 —— 索引不在就枚举不了
+        // 资源对象，那几千个对象要到第二轮扫描才会暴露出来，所以不能只补一轮。
+        // 每轮都是"先扫、缺了就补"，最后一轮只扫不补，拿到的就是最终的缺失清单
+        for (int attempt = 0; attempt <= 2; attempt++) {
+            missing.clear();
+            missingNames.clear();
+            ScanMissingFiles(mergedLibs, config, libsBase, versionJar, indexesDir, objectsDir,
+                             vj, parentVj, assetIndexObj, missing, missingNames);
+
+            if (missing.empty()) {
+                WriteLaunchLog("--- 文件完整性检查通过 ---");
+                return true;
+            }
+            if (attempt == 2) break;   // 补过两轮还缺，不再试，直接判失败
+
+            WriteLaunchLog("--- 缺失 " + std::to_string(missing.size()) + " 个文件（第 " +
+                           std::to_string(attempt + 1) + " 轮补齐） ---");
+            for (size_t i = 0; i < missingNames.size() && i < 40; i++) {
+                WriteLaunchLog("  - " + missingNames[i]);
+            }
+            // 只提示一次：别让用户看到两条一样的通知
+            if (!announced) {
+                announced = true;
+                EmitLaunchNotice("正在补齐缺失文件",
+                                 "检测到缺失文件，正在自动下载，补完会自动继续启动",
+                                 "info");
+            }
+
+            std::vector<RepairItem> failures;
+            const int repaired = RepairMissingFiles(missing, failures);
+            WriteLaunchLog("补齐结果: 成功 " + std::to_string(repaired) + " / " +
+                           std::to_string(missing.size()));
+            for (size_t i = 0; i < failures.size() && i < 20; i++) {
+                WriteLaunchLog("  补齐失败: " + failures[i].name);
+            }
+        }
+
+        WriteLaunchLog("--- 仍有 " + std::to_string(missing.size()) + " 个文件补齐失败 ---");
+
+        missingOut = nlohmann::json::array();
+        for (const auto& name : missingNames) missingOut.push_back(name);
+
+        bool hasFatal = false;
+        for (const auto& item : missing) {
+            if (item.fatal) {
+                hasFatal = true;
+                break;
+            }
+        }
+
+        if (!hasFatal) {
+            // 只缺资源对象：贴图 / 音效会退回默认，但游戏能玩，没必要拦着
+            EmitLaunchNotice("部分资源文件缺失",
+                             "有 " + std::to_string(missing.size()) +
+                             " 个资源文件没能补齐，游戏会以默认贴图启动",
+                             "warning");
+            return true;
+        }
+
+        error = "缺少 " + std::to_string(missing.size()) + " 个文件且自动补齐失败：";
+        for (size_t i = 0; i < missingNames.size() && i < 3; i++) {
+            if (i > 0) error += "、";
+            error += missingNames[i];
+        }
+        if (missingNames.size() > 3) error += " 等";
+        error += "。请检查网络后重试，详情见 .minecraft\\logs\\launch_*.log";
+        return false;
     }
 
     // 1.19 起客户端才启用聊天签名（enforce-secure-profile / 档案公钥都是那一版加的）。
@@ -1324,251 +1728,12 @@ private:
 
         WriteLaunchLog("合并后依赖: " + std::to_string(mergedLibs.size()) + " 个");
 
-        // ==================== 启动前文件完整性校验 ====================
-        // 这里只“校验”不“补下载”：没下完的版本应当回下载页补齐，启动路径上隐式拉取
-        // 会把启动长时间卡在静默下载里（还一直占着版本 JSON，版本目录都删不掉）。
-        // 唯一就地重下的是「文件在、但 SHA-1 对不上」的单文件损坏，代价小、不影响定位。
+        // ==================== 启动前文件完整性校验 + 自动补齐 ====================
+        // 缺什么就补什么：以前只校验不补，缺一个文件用户就得回下载页把整个版本重下一遍。
+        // 补不上、且缺的是库 / natives / 核心 jar 才拒绝启动；只缺资源对象就放行。
         std::wstring libsBase = minecraftDir + L"\\libraries";
-        std::vector<std::string> missingFiles;
-        int missingTotal = 0;
-
-        WriteLaunchLog("--- 开始文件完整性检查 ---");
-        WriteLaunchLog("版本 JSON 路径: " + Core::StringUtils::WideToUtf8(versionJsonPath));
-
-        if (mergedLibs.empty()) {
-            WriteLaunchLog("警告: 没有依赖库!");
-        } else {
-            WriteLaunchLog("依赖库数量: " + std::to_string(mergedLibs.size()));
-        }
-
-        // 检查所有库文件 (使用合并后的依赖列表)
-        {
-            int totalLibs = 0;
-            int skippedLibs = 0;
-            int checkedLibs = 0;
-
-            for (const auto& lib : mergedLibs) {
-                std::string name = lib.value("name", "");
-                totalLibs++;
-
-                if (!MavenUtils::CheckRulesMatch(lib)) {
-                    skippedLibs++;
-                    continue;
-                }
-
-                if (MavenUtils::IsLibraryIgnored(name, config)) {
-                    WriteLaunchLog("已忽略: " + name + " (在忽略列表中)");
-                    skippedLibs++;
-                    continue;
-                }
-
-                Models::MavenCoord coord = MavenUtils::ParseMavenName(name);
-                if (coord.groupId.empty() || coord.artifactId.empty() || coord.version.empty()) {
-                    WriteLaunchLog("跳过: " + name + " (无法解析 Maven 坐标)");
-                    continue;
-                }
-
-                checkedLibs++;
-
-                std::string mavenPath = MavenUtils::BuildMavenPath(coord);
-                std::string downloadUrl;
-                std::string sha1;
-
-                bool isNativeJar = !coord.classifier.empty() &&
-                                   (coord.classifier.find("natives") != std::string::npos);
-
-                if (lib.contains("downloads") && lib["downloads"].is_object()) {
-                    if (isNativeJar && lib["downloads"].contains("classifiers") &&
-                        lib["downloads"]["classifiers"].is_object() &&
-                        lib["downloads"]["classifiers"].contains(coord.classifier)) {
-                        const auto& classifierInfo = lib["downloads"]["classifiers"][coord.classifier];
-                        downloadUrl = classifierInfo.value("url", "");
-                        sha1 = classifierInfo.value("sha1", "");
-                        if (classifierInfo.contains("path")) {
-                            mavenPath = classifierInfo["path"].get<std::string>();
-                        }
-                    } else if (!isNativeJar && lib["downloads"].contains("artifact") &&
-                               lib["downloads"]["artifact"].is_object()) {
-                        const auto& artifact = lib["downloads"]["artifact"];
-                        downloadUrl = artifact.value("url", "");
-                        sha1 = artifact.value("sha1", "");
-                        if (artifact.contains("path")) {
-                            mavenPath = artifact["path"].get<std::string>();
-                        }
-                    }
-                }
-
-                if (downloadUrl.empty()) {
-                    if (lib.contains("downloadUrl") && !lib["downloadUrl"].get<std::string>().empty()) {
-                        downloadUrl = lib["downloadUrl"].get<std::string>();
-                        sha1 = lib.value("sha1", "");
-                    } else if (lib.contains("url") && !lib["url"].get<std::string>().empty()) {
-                        std::string baseUrl = lib["url"].get<std::string>();
-                        if (!baseUrl.empty() && baseUrl.back() != '/') baseUrl += '/';
-                        downloadUrl = baseUrl + mavenPath;
-                    } else {
-                        // 使用下载源管理器获取库文件URL（支持镜像故障转移）
-                        // 检测是否为Forge依赖
-                        bool isForgeDep = (mavenPath.find("net/minecraftforge/") != std::string::npos);
-                        std::vector<std::string> libUrls;
-                        if (isForgeDep) {
-                            libUrls = Core::DownloadSourceManager::GetForgeDownloadUrls(mavenPath);
-                        } else {
-                            libUrls = Core::DownloadSourceManager::GetLibraryMirrorUrls(mavenPath);
-                        }
-                        downloadUrl = libUrls.empty() ? "" : libUrls[0];
-                    }
-                } else {
-                    // 已有downloadUrl，检测是否为Forge依赖并替换为镜像源
-                    bool isForgeDep = (downloadUrl.find("maven.minecraftforge.net") != std::string::npos) ||
-                                      (mavenPath.find("net/minecraftforge/") != std::string::npos);
-                    if (isForgeDep) {
-                        std::vector<std::string> forgeUrls = Core::DownloadSourceManager::GetForgeDownloadUrls(mavenPath);
-                        if (!forgeUrls.empty()) {
-                            downloadUrl = forgeUrls[0];
-                        }
-                    }
-                }
-
-                std::string localPath = mavenPath;
-                std::replace(localPath.begin(), localPath.end(), '/', '\\');
-                std::wstring jarPath = libsBase + L"\\" + Core::StringUtils::Utf8ToWide(localPath);
-
-                DWORD attr = GetFileAttributesW(jarPath.c_str());
-                if (attr == INVALID_FILE_ATTRIBUTES) {
-                    WriteLaunchLog("缺失: " + name);
-                    WriteLaunchLog("  路径: " + Core::StringUtils::WideToUtf8(jarPath));
-                    missingTotal++;
-                    missingFiles.push_back(name);
-                } else if (!sha1.empty()) {
-                    std::string existingHash = Core::HashUtils::ComputeFileSHA1(jarPath);
-                    if (existingHash != sha1) {
-                        WriteLaunchLog("损坏: " + name);
-                        WriteLaunchLog("  期望: " + sha1);
-                        WriteLaunchLog("  实际: " + existingHash);
-                        DeleteFileW(jarPath.c_str());
-                        if (!downloadUrl.empty()) {
-                            Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(downloadUrl));
-                            if (res.status == 200 && !res.body.empty()) {
-                                Core::FileManager::SaveFile(jarPath, res.body);
-                                WriteLaunchLog("  重新下载完成");
-                            } else {
-                                missingTotal++;
-                                missingFiles.push_back(name);
-                            }
-                        }
-                    }
-                }
-
-                // 处理有 natives 字段的库
-                if (!isNativeJar && lib.contains("natives") && lib["natives"].is_object() &&
-                    lib.contains("downloads") && lib["downloads"].is_object() &&
-                    lib["downloads"].contains("classifiers") && lib["downloads"]["classifiers"].is_object()) {
-
-                    std::string classifierKey;
-#if defined(_WIN32)
-                    if (lib["natives"].contains("windows")) classifierKey = lib["natives"]["windows"].get<std::string>();
-#elif defined(__APPLE__)
-                    if (lib["natives"].contains("osx")) classifierKey = lib["natives"]["osx"].get<std::string>();
-#else
-                    if (lib["natives"].contains("linux")) classifierKey = lib["natives"]["linux"].get<std::string>();
-#endif
-
-                    if (!classifierKey.empty() && lib["downloads"]["classifiers"].contains(classifierKey)) {
-                        const auto& ci = lib["downloads"]["classifiers"][classifierKey];
-                        std::string nativeUrl = ci.value("url", "");
-                        std::string nativeSha1 = ci.value("sha1", "");
-                        std::string nativePath = ci.value("path", "");
-
-                        if (nativePath.empty()) {
-                            nativePath = MavenUtils::BuildMavenPath(coord);
-                            size_t lastSlash = nativePath.find_last_of('/');
-                            if (lastSlash != std::string::npos) {
-                                std::string classifier = classifierKey;
-                                size_t archPos = classifier.find("${arch}");
-                                if (archPos != std::string::npos) classifier.replace(archPos, 7, "64");
-                                nativePath = nativePath.substr(0, lastSlash + 1) +
-                                           coord.artifactId + "-" + coord.version + "-" + classifier + ".jar";
-                            }
-                        }
-
-                        if (!nativePath.empty()) {
-                            std::string localNativePath = nativePath;
-                            std::replace(localNativePath.begin(), localNativePath.end(), '/', '\\');
-                            std::wstring nativeJarPath = libsBase + L"\\" + Core::StringUtils::Utf8ToWide(localNativePath);
-
-                            DWORD nativeAttr = GetFileAttributesW(nativeJarPath.c_str());
-                            if (nativeAttr == INVALID_FILE_ATTRIBUTES) {
-                                WriteLaunchLog("缺失 Natives JAR: " + nativePath);
-                                missingTotal++;
-                                missingFiles.push_back(name + " (natives)");
-                            } else if (!nativeSha1.empty()) {
-                                std::string existingHash = Core::HashUtils::ComputeFileSHA1(nativeJarPath);
-                                if (existingHash != nativeSha1) {
-                                    WriteLaunchLog("损坏 Natives JAR: " + nativePath);
-                                    DeleteFileW(nativeJarPath.c_str());
-                                    if (!nativeUrl.empty()) {
-                                        Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(nativeUrl));
-                                        if (res.status == 200 && !res.body.empty()) {
-                                            Core::FileManager::SaveFile(nativeJarPath, res.body);
-                                            WriteLaunchLog("  Natives JAR 重新下载完成");
-                                        } else {
-                                            missingTotal++;
-                                            missingFiles.push_back(name + " (natives)");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            WriteLaunchLog("库文件统计: 总计 " + std::to_string(totalLibs) + ", 跳过 " + std::to_string(skippedLibs) + ", 检查 " + std::to_string(checkedLibs));
-        }
-
-        // 检查版本 JAR (游戏核心)
-        // 加载器版本本身没有 downloads.client，游戏核心是继承的原版 jar；
-        // 路径必须按实际落盘命名解析，否则 jar 不会被加入 classpath。
-        std::wstring versionJar = ResolveGameJarPath(minecraftDir, versionDir, profileName, actualVersionId, vj);
-        if (vj.contains("downloads") && vj["downloads"].is_object() &&
-            vj["downloads"].contains("client") && vj["downloads"]["client"].is_object()) {
-            const auto& client = vj["downloads"]["client"];
-            std::string clientUrl = client.value("url", "");
-            std::string clientSha1 = client.value("sha1", "");
-
-            DWORD jarAttr = GetFileAttributesW(versionJar.c_str());
-            if (jarAttr == INVALID_FILE_ATTRIBUTES) {
-                // 缺失统一交给下面那段记一次，这里只处理「存在但校验失败」的损坏重下
-                WriteLaunchLog("缺失版本 JAR: " + profileName);
-            } else if (!clientSha1.empty()) {
-                std::string existingHash = Core::HashUtils::ComputeFileSHA1(versionJar);
-                if (existingHash != clientSha1) {
-                    WriteLaunchLog("损坏版本 JAR: " + profileName);
-                    DeleteFileW(versionJar.c_str());
-                    if (!clientUrl.empty()) {
-                        Models::HttpResult res = Core::HttpClient::HttpGet(Core::StringUtils::Utf8ToWide(clientUrl));
-                        if (res.status == 200 && !res.body.empty()) {
-                            Core::FileManager::SaveFile(versionJar, res.body);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 游戏核心 jar 仍然缺失时明确报错。
-        // 加载器版本没有 downloads.client 可下载，这里不检查就会一路走到启动，
-        // 最终由 Forge/FML 抛出难以定位的 "your vanilla jar may be corrupt"。
-        if (GetFileAttributesW(versionJar.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            WriteLaunchLog("缺失游戏核心 JAR: " + Core::StringUtils::WideToUtf8(versionJar));
-            missingTotal++;
-            missingFiles.push_back(Core::StringUtils::WideToUtf8(versionJar));
-        }
-
-        // 检查资源文件 (assets)
-        std::wstring assetsDir = minecraftDir + L"\\assets";
-        std::wstring indexesDir = assetsDir + L"\\indexes";
-        std::wstring objectsDir = assetsDir + L"\\objects";
+        const std::wstring versionJar =
+            ResolveGameJarPath(minecraftDir, versionDir, profileName, actualVersionId, vj);
 
         // assetIndex 来源: 当前版本 JSON 或原版 JSON (inheritsFrom)
         nlohmann::json assetIndexObj;
@@ -1579,75 +1744,17 @@ private:
             WriteLaunchLog("使用原版 JSON 的 assetIndex");
         }
 
-        if (!assetIndexObj.empty()) {
-            std::string assetIndexId = assetIndexObj.value("id", "");
-
-            if (!assetIndexId.empty()) {
-                std::wstring indexPath = indexesDir + L"\\" + Core::StringUtils::Utf8ToWide(assetIndexId) + L".json";
-
-                DWORD indexAttr = GetFileAttributesW(indexPath.c_str());
-                if (indexAttr == INVALID_FILE_ATTRIBUTES) {
-                    WriteLaunchLog("缺失资源索引: " + assetIndexId);
-                    missingTotal++;
-                    missingFiles.push_back("assets/indexes/" + assetIndexId + ".json");
-                }
-
-                std::ifstream indexFile(indexPath);
-                if (indexFile.is_open()) {
-                    std::stringstream indexSS;
-                    indexSS << indexFile.rdbuf();
-                    nlohmann::json assetIndex;
-                    try {
-                        assetIndex = nlohmann::json::parse(indexSS.str());
-                    } catch (...) {
-                        WriteLaunchLog("警告: 资源索引解析失败");
-                    }
-
-                    if (assetIndex.contains("objects") && assetIndex["objects"].is_object()) {
-                        int totalAssets = 0;
-                        int missingAssets = 0;
-                        for (const auto& [name, obj] : assetIndex["objects"].items()) {
-                            if (!obj.is_object() || !obj.contains("hash")) continue;
-                            totalAssets++;
-                            std::string hash = obj["hash"].get<std::string>();
-                            if (hash.size() < 2) continue;
-
-                            std::string prefix = hash.substr(0, 2);
-                            std::wstring objPath = objectsDir + L"\\" + Core::StringUtils::Utf8ToWide(prefix) + L"\\" + Core::StringUtils::Utf8ToWide(hash);
-
-                            DWORD objAttr = GetFileAttributesW(objPath.c_str());
-                            if (objAttr == INVALID_FILE_ATTRIBUTES) {
-                                missingAssets++;
-                                missingTotal++;
-                                // 资源文件动辄上千个，逐条塞进提示和日志会把两边都撑爆，
-                                // 只留前 20 条做样例，真实数量看 missingTotal
-                                if (missingAssets <= 20) {
-                                    missingFiles.push_back("assets/objects/" + prefix + "/" + hash);
-                                }
-                            }
-                        }
-                        WriteLaunchLog("资源文件: " + std::to_string(totalAssets) + " 个, 缺失 " + std::to_string(missingAssets) + " 个");
-                    }
-                }
-            }
-        }
-
-        if (missingTotal > 0) {
-            WriteLaunchLog("--- 文件完整性校验未通过 ---");
-            WriteLaunchLog("缺失 " + std::to_string(missingTotal) + " 个文件:");
-            for (const auto& f : missingFiles) {
-                WriteLaunchLog("  - " + f);
-            }
-            // 启动路径不再隐式补下载：让用户回下载页把版本下完，比在这里静默拉取上千个文件好定位，
-            // 也不会再把版本目录长时间占住
+        std::string fileError;
+        nlohmann::json missingDetail = nlohmann::json::array();
+        if (!EnsureGameFiles(mergedLibs, config, minecraftDir, versionJar, vj, parentVj,
+                             assetIndexObj, fileError, missingDetail)) {
+            WriteLaunchLog("错误: " + fileError);
             return {{"ok", false},
-                    {"missingCount", missingTotal},
-                    {"missing", missingFiles},
-                    {"error", "版本文件不完整：缺少 " + std::to_string(missingTotal) +
-                              " 个文件，请先到「下载」页重新下载该版本再启动"}};
+                    {"missingCount", static_cast<int>(missingDetail.size())},
+                    {"missing", missingDetail},
+                    {"error", fileError}};
         }
 
-        WriteLaunchLog("--- 文件完整性检查通过 ---");
         WriteLaunchLog("库文件: OK");
         WriteLaunchLog("Natives: OK");
         WriteLaunchLog("游戏核心: OK");

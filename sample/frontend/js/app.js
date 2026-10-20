@@ -3651,6 +3651,12 @@
 
     if (event.status === 'waiting_window') {
       startGameBtn.textContent = '等待游戏窗口出现';
+    } else if (event.status === 'repairing') {
+      // 后端发现缺文件，正在自动补齐。两个入口的按钮一起显示进度，
+      // 否则用户会以为点了没反应
+      const label = `补齐文件 ${event.done || 0}/${event.total || 0}`;
+      startGameBtn.textContent = label;
+      if (launchRowBtn) launchRowBtn.textContent = label;
     } else if (event.status === 'window_ready') {
       startGameBtn.textContent = '游戏已启动';
       gameLaunchInProgress = false;
@@ -3770,7 +3776,13 @@
       } else {
         startGameBtn.textContent = '启动失败';
         gameLaunchInProgress = false;
-        alert((result && result.error) || '启动游戏失败');
+        // 和版本列表里那个入口统一用右上角通知，别一个 alert 一个通知
+        showNotification({
+          title: '启动失败',
+          content: (result && result.error) || '启动游戏失败',
+          type: 'error',
+          duration: 8000
+        });
         setTimeout(() => {
           startGameBtn.textContent = '开始游戏';
           startGameBtn.disabled = false;
@@ -3779,7 +3791,12 @@
     }).catch((err) => {
       startGameBtn.textContent = '启动失败';
       gameLaunchInProgress = false;
-      alert('启动游戏失败: ' + (err.message || '未知错误'));
+      showNotification({
+        title: '启动失败',
+        content: '启动游戏失败: ' + (err.message || '未知错误'),
+        type: 'error',
+        duration: 8000
+      });
       setTimeout(() => {
         startGameBtn.textContent = '开始游戏';
         startGameBtn.disabled = false;

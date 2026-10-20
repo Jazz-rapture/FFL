@@ -663,6 +663,24 @@ void Window::SetupResourceInterception() {
             frontendDir.c_str(),
             COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW
         );
+
+        // 额外映射的本地目录（用户素材）：目录先建出来，前端"打开文件夹"才点得开。
+        // 这些主机名不在下面的 WebResourceRequested 过滤器里，由 WebView2 直接
+        // 从磁盘读，不走 VirtualFS
+        for (const auto& folderHost : config_.folder_hosts) {
+            if (folderHost.first.empty() || folderHost.second.empty()) continue;
+
+            CreateDirectoryW(folderHost.second.c_str(), nullptr);
+
+            std::wstring hostW = Utf8ToWide(folderHost.first);
+            if (hostW.empty()) continue;
+
+            webview3->SetVirtualHostNameToFolderMapping(
+                hostW.c_str(),
+                folderHost.second.c_str(),
+                COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW
+            );
+        }
     }
 
     // 拦截所有 tauricpp.app 请求，从内存VirtualFS提供内容
